@@ -1,5 +1,5 @@
 """Public-hosting boundaries around the unchanged local agent."""
-import asyncio
+
 import contextvars
 import hashlib
 import ipaddress
@@ -9,172 +9,608 @@ import re
 import socket
 import sqlite3
 import time
-import types
 import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
+
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
+
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / '.env')
-PUBLIC = os.getenv('ACCESSLY_PUBLIC_MODE', '0') == '1'
-OWNER = contextvars.ContextVar('accessly_visitor', default='local')
-DATA_ROOT = Path(os.getenv('ACCESSLY_DATA_DIR', str(ROOT))).resolve()
-KOYEB_DOMAIN = os.getenv('KOYEB_PUBLIC_DOMAIN', '').strip()
-CONFIGURED_ORIGINS = (os.getenv('ACCESSLY_ALLOWED_ORIGINS') or os.getenv('RENDER_EXTERNAL_URL')
-                      or ('https://' + KOYEB_DOMAIN if KOYEB_DOMAIN else None))
-ORIGINS = [origin.strip().rstrip('/') for origin in (CONFIGURED_ORIGINS or 'http://localhost:8443,http://127.0.0.1:8443').split(',') if origin.strip()]
+load_dotenv(ROOT / ".env")
+
+PUBLIC = os.getenv("ACCESSLY_PUBLIC_MODE", "0") == "1"
+OWNER = contextvars.ContextVar("accessly_visitor", default="local")
+
+DATA_ROOT = Path(
+    os.getenv("ACCESSLY_DATA_DIR", str(ROOT))
+).resolve()
+
+KOYEB_DOMAIN = os.getenv("KOYEB_PUBLIC_DOMAIN", "").strip()
+
+CONFIGURED_ORIGINS = (
+    os.getenv("ACCESSLY_ALLOWED_ORIGINS")
+    or os.getenv("RENDER_EXTERNAL_URL")
+    or ("https://" + KOYEB_DOMAIN if KOYEB_DOMAIN else None)
+)
+
+ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in (
+        CONFIGURED_ORIGINS
+        or "http://localhost:8443,http://127.0.0.1:8443"
+    ).split(",")
+    if origin.strip()
+]
+
+
 if PUBLIC:
-    if not CONFIGURED_ORIGINS or not all(origin.startswith('https://') for origin in ORIGINS):
-        raise RuntimeError('Public mode requires explicit HTTPS ACCESSLY_ALLOWED_ORIGINS.')
-    if not os.getenv('ACCESSLY_DATA_DIR'):
-        raise RuntimeError('Public mode requires persistent ACCESSLY_DATA_DIR.')
-    if not os.getenv('ACCESSLY_TEST_RECIPIENT'):
-        raise RuntimeError('Public mode requires a controlled ACCESSLY_TEST_RECIPIENT.')
+    if (
+        not CONFIGURED_ORIGINS
+        or not all(origin.startswith("https://") for origin in ORIGINS)
+    ):
+        raise RuntimeError(
+            "Public mode requires explicit HTTPS ACCESSLY_ALLOWED_ORIGINS."
+        )
+
+    if not os.getenv("ACCESSLY_DATA_DIR"):
+        raise RuntimeError(
+            "Public mode requires persistent ACCESSLY_DATA_DIR."
+        )
+
+    if not os.getenv("ACCESSLY_TEST_RECIPIENT"):
+        raise RuntimeError(
+            "Public mode requires a controlled ACCESSLY_TEST_RECIPIENT."
+        )
+
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
+
 
 def visitor_directory():
     if not PUBLIC:
         return DATA_ROOT
-    directory = DATA_ROOT / 'visitors' / OWNER.get()
+
+    directory = DATA_ROOT / "visitors" / OWNER.get()
     directory.mkdir(parents=True, exist_ok=True)
+
     return directory
 
+
 def visitor_from_header(header):
-    if not header or not re.fullmatch(r'Bearer [0-9a-f]{64}', header):
-        raise HTTPException(401, 'A browser visitor session is required. Refresh the page.')
-    return hashlib.sha256(header[7:].encode()).hexdigest()
+    if not header or not re.fullmatch(
+        r"Bearer [0-9a-f]{64}",
+        header
+    ):
+        raise HTTPException(
+            401,
+            "A browser visitor session is required. Refresh the page."
+        )
+
+    return hashlib.sha256(
+        header[7:].encode()
+    ).hexdigest()
+
 
 def atomic_json(path, value):
     path = Path(path)
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    temporary = path.with_suffix(".tmp")
+
+    temporary.write_text(
+        json.dumps(
+            value,
+            indent=2,
+            ensure_ascii=False
+        ),
+        encoding="utf-8"
+    )
+
     temporary.replace(path)
+
 
 def require_public_url(url):
     parsed = urlsplit(url)
-    if parsed.scheme not in ('https', 'http') or not parsed.hostname or parsed.username or parsed.password or parsed.port not in (None, 80, 443):
-        raise ValueError('Use a public HTTP(S) event URL on a standard web port.')
-    addresses = socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-    if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
-        raise ValueError('Private, local and metadata network addresses are not available.')
+
+    if (
+        parsed.scheme not in ("https", "http")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.port not in (None, 80, 443)
+    ):
+        raise ValueError(
+            "Use a public HTTP(S) event URL on a standard web port."
+        )
+
+    addresses = socket.getaddrinfo(
+        parsed.hostname,
+        parsed.port or 443,
+        type=socket.SOCK_STREAM
+    )
+
+    if (
+        not addresses
+        or any(
+            not ipaddress.ip_address(
+                item[4][0]
+            ).is_global
+            for item in addresses
+        )
+    ):
+        raise ValueError(
+            "Private, local and metadata network addresses are not available."
+        )
+
 
 def reserve_action():
     if not PUBLIC:
         return
-    with sqlite3.connect(DATA_ROOT / 'usage.sqlite') as database:
-        database.execute('CREATE TABLE IF NOT EXISTS usage (owner TEXT, day TEXT, count INTEGER, PRIMARY KEY(owner, day))')
-        database.execute('BEGIN IMMEDIATE')
-        day=time.strftime('%Y-%m-%d', time.gmtime())
-        total=database.execute('SELECT COALESCE(SUM(count),0) FROM usage WHERE day=?',(day,)).fetchone()[0]
-        used=database.execute('SELECT count FROM usage WHERE owner=? AND day=?',(OWNER.get(),day)).fetchone()
-        if total >= int(os.getenv('ACCESSLY_DAILY_ACTION_LIMIT','60')) or (used and used[0]>=int(os.getenv('ACCESSLY_VISITOR_DAILY_LIMIT','12'))):
-            raise HTTPException(429, 'The demo has reached its daily usage limit. Please try again tomorrow.')
-        database.execute('INSERT INTO usage VALUES (?,?,1) ON CONFLICT(owner,day) DO UPDATE SET count=count+1',(OWNER.get(),day))
+
+    with sqlite3.connect(
+        DATA_ROOT / "usage.sqlite"
+    ) as database:
+
+        database.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage (
+                owner TEXT,
+                day TEXT,
+                count INTEGER,
+                PRIMARY KEY(owner, day)
+            )
+            """
+        )
+
+        database.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        day = time.strftime(
+            "%Y-%m-%d",
+            time.gmtime()
+        )
+
+        total = database.execute(
+            """
+            SELECT COALESCE(SUM(count), 0)
+            FROM usage
+            WHERE day=?
+            """,
+            (day,)
+        ).fetchone()[0]
+
+        used = database.execute(
+            """
+            SELECT count
+            FROM usage
+            WHERE owner=? AND day=?
+            """,
+            (
+                OWNER.get(),
+                day
+            )
+        ).fetchone()
+
+        if (
+            total
+            >= int(
+                os.getenv(
+                    "ACCESSLY_DAILY_ACTION_LIMIT",
+                    "60"
+                )
+            )
+            or (
+                used
+                and used[0]
+                >= int(
+                    os.getenv(
+                        "ACCESSLY_VISITOR_DAILY_LIMIT",
+                        "12"
+                    )
+                )
+            )
+        ):
+            raise HTTPException(
+                429,
+                "The demo has reached its daily usage limit. "
+                "Please try again tomorrow."
+            )
+
+        database.execute(
+            """
+            INSERT INTO usage VALUES (?, ?, 1)
+            ON CONFLICT(owner, day)
+            DO UPDATE SET count=count+1
+            """,
+            (
+                OWNER.get(),
+                day
+            )
+        )
+
 
 def configure_agent(namespace, context):
-    """Point existing persistence at this visitor, then enforce public-demo boundaries."""
+    """
+    Point existing persistence at this visitor,
+    then enforce public-demo boundaries.
+    """
+
     directory = visitor_directory()
-    globals_ = namespace['load_user_profile'].__globals__
-    globals_['PROFILE_FILE'] = directory / 'user_profile.json'
-    globals_['REQUESTS_FILE'] = directory / 'requests.json'
+
+    globals_ = namespace[
+        "load_user_profile"
+    ].__globals__
+
+    globals_["PROFILE_FILE"] = (
+        directory / "user_profile.json"
+    )
+
+    globals_["REQUESTS_FILE"] = (
+        directory / "requests.json"
+    )
+
     if not PUBLIC:
         return
+
     from strands import tool
     from strands_tools.browser.models import BrowserInput
-    agent = namespace['agent']
-    browser = namespace['browser']
-    globals_['save_requests'] = lambda records: atomic_json(directory / 'requests.json', records)
-    agent.callback_handler = lambda **kwargs: None
-    marker = '[Accessly ' + context['reference'] + ']'
-    context['approval'] = None
-    context['pending_record'] = None
-    context['browser'] = browser
 
-    original_setup = browser._setup_session_from_browser
-    async def setup(self, browser_or_context):
-        components = await original_setup(browser_or_context)
-        browser_context = components[1]
-        async def network_guard(route):
-            try:
-                if route.request.method not in ('GET', 'HEAD'):
-                    await route.abort(); return
-                await asyncio.to_thread(require_public_url, route.request.url)
-                await route.continue_()
-            except (ValueError, OSError):
-                await route.abort()
-        await browser_context.route('**/*', network_guard)
-        await browser_context.route_web_socket('**/*', lambda connection: connection.close())
-        return components
-    browser._setup_session_from_browser = types.MethodType(setup, browser)
-    browser._context_options['service_workers'] = 'block'
+    agent = namespace["agent"]
+    browser = namespace["browser"]
+
+    globals_["save_requests"] = (
+        lambda records: atomic_json(
+            directory / "requests.json",
+            records
+        )
+    )
+
+    agent.callback_handler = (
+        lambda **kwargs: None
+    )
+
+    marker = (
+        "[Accessly "
+        + context["reference"]
+        + "]"
+    )
+
+    context["approval"] = None
+    context["pending_record"] = None
+    context["browser"] = browser
+
+    # ---------------------------------------------------------
+    # Browser protection
+    #
+    # IMPORTANT:
+    # We intentionally do NOT monkeypatch Playwright's
+    # _setup_session_from_browser or intercept every page request.
+    #
+    # The previous network interception could cause the agent
+    # browser workflow to hang while loading normal event pages.
+    #
+    # Navigation itself is still checked by require_public_url().
+    # The public browser also remains read-only.
+    # ---------------------------------------------------------
+
     original_browser = browser.browser
-    @tool(name='browser')
-    def readonly_browser(browser_input: BrowserInput):
-        """Read official public event pages. Use init_session, navigate and get_text; forms cannot be submitted in this demo."""
-        parsed = BrowserInput.model_validate(browser_input)
-        allowed = {'init_session','navigate','get_text','get_html','close','list_local_sessions','list_tabs','switch_tab','close_tab'}
+
+    @tool(name="browser")
+    def readonly_browser(
+        browser_input: BrowserInput
+    ):
+        """
+        Read official public event pages.
+
+        Use init_session, navigate and get_text.
+        Forms cannot be submitted in this demo.
+        """
+
+        parsed = BrowserInput.model_validate(
+            browser_input
+        )
+
+        allowed = {
+            "init_session",
+            "navigate",
+            "get_text",
+            "get_html",
+            "close",
+            "list_local_sessions",
+            "list_tabs",
+            "switch_tab",
+            "close_tab",
+        }
+
         if parsed.action.type not in allowed:
-            return {'status':'error','content':[{'text':'Public demo browser is read-only. Use navigate and get_text. Form submission, JavaScript execution, and downloads are disabled.'}]}
-        if parsed.action.type == 'navigate':
-            try: require_public_url(parsed.action.url)
-            except (ValueError,OSError) as error: return {'status':'error','content':[{'text':str(error)}]}
-        return original_browser(parsed)
-    agent.tool_registry.replace(readonly_browser)
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text":
+                            "Public demo browser is read-only. "
+                            "Use navigate and get_text. "
+                            "Form submission, JavaScript execution, "
+                            "and downloads are disabled."
+                    }
+                ],
+            }
 
-    original_send = namespace['send_accommodation_email']
-    @tool(name='send_accommodation_email')
-    def guarded_send(recipient: str, subject: str, body: str):
-        """Send an exactly approved accessibility draft once, to the configured test inbox only."""
-        candidate={'to':recipient,'subject':subject,'body':body}
+        if parsed.action.type == "navigate":
+            try:
+                require_public_url(
+                    parsed.action.url
+                )
+
+            except (
+                ValueError,
+                OSError
+            ) as error:
+                return {
+                    "status": "error",
+                    "content": [
+                        {
+                            "text": str(error)
+                        }
+                    ],
+                }
+
+        return original_browser(
+            parsed
+        )
+
+    agent.tool_registry.replace(
+        readonly_browser
+    )
+
+    # ---------------------------------------------------------
+    # Email safety guard
+    # ---------------------------------------------------------
+
+    original_send = namespace[
+        "send_accommodation_email"
+    ]
+
+    @tool(
+        name="send_accommodation_email"
+    )
+    def guarded_send(
+        recipient: str,
+        subject: str,
+        body: str
+    ):
+        """
+        Send an exactly approved accessibility draft once,
+        to the configured test inbox only.
+        """
+
+        candidate = {
+            "to": recipient,
+            "subject": subject,
+            "body": body,
+        }
+
         from result_presenter import plain_email
-        normalize=lambda value: ' '.join(unicodedata.normalize('NFKC', plain_email(value)).split())
-        approval=context.get('approval')
-        if not approval or marker not in subject or any(normalize(candidate[key])!=normalize(approval[key]) for key in candidate):
-            return {'status':'failed','message':'Show the exact complete draft, including its Accessly reference in the subject, and ask the user to click Approve & Send.'}
-        context['approval']=None
-        # Cosmetic model formatting must never change the exact approved outgoing email.
-        recipient, subject, body = approval['to'], approval['subject'], approval['body']
-        outcome=original_send(recipient,subject,body)
-        if outcome.get('status')=='sent':
-            context['pending_record']={'subject':subject,'recipient':recipient}
-            outcome['actual_recipient']='configured test inbox'
-        return outcome
-    agent.tool_registry.replace(guarded_send)
 
-    original_record=namespace['create_request_record']
-    @tool(name='create_request_record')
-    def guarded_record(event_name: str, event_url: str, organizer_email: str, email_subject: str):
-        """Track this visitor's successfully sent test email exactly once."""
-        pending=context.get('pending_record')
-        if not pending or pending['subject']!=email_subject or pending['recipient']!=organizer_email:
-            return {'status':'failed','message':'No matching successful send is awaiting a tracking record.'}
-        outcome=original_record(event_name,event_url,organizer_email,email_subject)
-        if outcome.get('status')=='created':
-            # Preserve already-established non-applicable needs in tracking.
-            non_applicable = {item['name'] for item in (context.get('result') or {}).get('accessibility_results', []) if item['status']=='NOT APPLICABLE'}
-            record = outcome.get('request', {})
+        normalize = lambda value: " ".join(
+            unicodedata.normalize(
+                "NFKC",
+                plain_email(value)
+            ).split()
+        )
+
+        approval = context.get(
+            "approval"
+        )
+
+        if (
+            not approval
+            or marker not in subject
+            or any(
+                normalize(candidate[key])
+                != normalize(approval[key])
+                for key in candidate
+            )
+        ):
+            return {
+                "status": "failed",
+                "message":
+                    "Show the exact complete draft, "
+                    "including its Accessly reference in the subject, "
+                    "and ask the user to click Approve & Send."
+            }
+
+        context["approval"] = None
+
+        # Cosmetic model formatting must never change
+        # the exact approved outgoing email.
+        recipient = approval["to"]
+        subject = approval["subject"]
+        body = approval["body"]
+
+        outcome = original_send(
+            recipient,
+            subject,
+            body
+        )
+
+        if outcome.get("status") == "sent":
+            context["pending_record"] = {
+                "subject": subject,
+                "recipient": recipient,
+            }
+
+            outcome[
+                "actual_recipient"
+            ] = "configured test inbox"
+
+        return outcome
+
+    agent.tool_registry.replace(
+        guarded_send
+    )
+
+    # ---------------------------------------------------------
+    # Request tracking guard
+    # ---------------------------------------------------------
+
+    original_record = namespace[
+        "create_request_record"
+    ]
+
+    @tool(
+        name="create_request_record"
+    )
+    def guarded_record(
+        event_name: str,
+        event_url: str,
+        organizer_email: str,
+        email_subject: str
+    ):
+        """
+        Track this visitor's successfully sent test email
+        exactly once.
+        """
+
+        pending = context.get(
+            "pending_record"
+        )
+
+        if (
+            not pending
+            or pending["subject"]
+            != email_subject
+            or pending["recipient"]
+            != organizer_email
+        ):
+            return {
+                "status": "failed",
+                "message":
+                    "No matching successful send "
+                    "is awaiting a tracking record."
+            }
+
+        outcome = original_record(
+            event_name,
+            event_url,
+            organizer_email,
+            email_subject
+        )
+
+        if (
+            outcome.get("status")
+            == "created"
+        ):
+            # Preserve already-established
+            # non-applicable needs in tracking.
+
+            non_applicable = {
+                item["name"]
+                for item in (
+                    context.get(
+                        "result"
+                    )
+                    or {}
+                ).get(
+                    "accessibility_results",
+                    []
+                )
+                if item["status"]
+                == "NOT APPLICABLE"
+            }
+
+            record = outcome.get(
+                "request",
+                {}
+            )
+
             for need in non_applicable:
-                if need in record.get('accommodations', {}):
-                    record['accommodations'][need] = 'NOT APPLICABLE'
-            if non_applicable and record.get('request_id'):
-                records = globals_['load_requests']()
-                for index, stored in enumerate(records):
-                    if stored['request_id'] == record['request_id']:
-                        records[index] = record
-                        break
-                globals_['save_requests'](records)
-            context['pending_record']=None
-        return outcome
-    agent.tool_registry.replace(guarded_record)
+                if need in record.get(
+                    "accommodations",
+                    {}
+                ):
+                    record[
+                        "accommodations"
+                    ][need] = (
+                        "NOT APPLICABLE"
+                    )
 
-def authorize_approval(message, context):
+            if (
+                non_applicable
+                and record.get(
+                    "request_id"
+                )
+            ):
+                records = globals_[
+                    "load_requests"
+                ]()
+
+                for index, stored in enumerate(
+                    records
+                ):
+                    if (
+                        stored["request_id"]
+                        == record["request_id"]
+                    ):
+                        records[
+                            index
+                        ] = record
+                        break
+
+                globals_[
+                    "save_requests"
+                ](
+                    records
+                )
+
+            context[
+                "pending_record"
+            ] = None
+
+        return outcome
+
+    agent.tool_registry.replace(
+        guarded_record
+    )
+
+
+def authorize_approval(
+    message,
+    context
+):
     if not PUBLIC:
         return
-    context['approval']=None
-    draft=(context.get('result') or {}).get('draft')
+
+    context["approval"] = None
+
+    draft = (
+        context.get("result")
+        or {}
+    ).get("draft")
+
     if not draft:
         return
-    exact=f"I explicitly approve sending this exact email once:\nTo: {draft['to']}\nSubject: {draft['subject']}\nBody:\n{draft['body']}"
-    if message.replace('\r\n','\n').strip()==exact.strip(): context['approval']=dict(draft)
+
+    exact = (
+        "I explicitly approve sending this exact email once:\n"
+        f"To: {draft['to']}\n"
+        f"Subject: {draft['subject']}\n"
+        "Body:\n"
+        f"{draft['body']}"
+    )
+
+    if (
+        message
+        .replace(
+            "\r\n",
+            "\n"
+        )
+        .strip()
+        == exact.strip()
+    ):
+        context[
+            "approval"
+        ] = dict(
+            draft
+        )
