@@ -5,7 +5,11 @@ from datetime import date, datetime
 import smtplib
 import ssl
 import unicodedata
+import re
+import html as html_lib
+from copy import deepcopy
 from email.message import EmailMessage
+from email.utils import parseaddr
 import imaplib
 import email
 from email.header import decode_header
@@ -17,6 +21,62 @@ load_dotenv()
 
 sent_requests = []
 browser = LocalChromiumBrowser()
+
+# Public event research contains no user-private data, so caching the same
+# event URL avoids repeated Firecrawl calls within the same process.
+_RESEARCH_EVENT_CACHE = {}
+
+@tool
+def research_event(event_url: str):
+    """
+    Research one event from the ORIGINAL event URL supplied by the user.
+
+    Call this tool exactly once per event analysis. It already performs the
+    event-page retrieval, relevant official-link inspection, and official-domain
+    search fallback through Accessly's web retrieval layer.
+
+    Do not call this tool again with links returned by this tool.
+    """
+
+    normalized_url = event_url.strip().rstrip("/")
+
+    if normalized_url in _RESEARCH_EVENT_CACHE:
+        cached = deepcopy(_RESEARCH_EVENT_CACHE[normalized_url])
+        cached["cache_hit"] = True
+        return cached
+
+    try:
+        from web_retrieval import research_event as retrieve_event
+        result = retrieve_event(event_url)
+
+        if isinstance(result, dict):
+            result = deepcopy(result)
+            result.setdefault("cache_hit", False)
+            result["research_complete"] = result.get("status") == "success"
+            result["tool_guidance"] = (
+                "Event web research is complete for this URL. Do not call "
+                "research_event again for links discovered in this result. "
+                "Use the returned evidence. Use the browser only for an "
+                "interactive form/page or when retrieval failed."
+            )
+
+            if result.get("status") == "success":
+                _RESEARCH_EVENT_CACHE[normalized_url] = deepcopy(result)
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "failed",
+            "event_url": event_url,
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "message": (
+                "The event could not be researched with the primary "
+                "web retrieval layer. Use the browser only as a fallback."
+            )
+        }
+
 
 @tool
 def check_event_timing(event_date: str, preferred_notice_days: int):
@@ -55,9 +115,6 @@ def check_event_accessibility(event_url: str):
         "accessible_entrance": "East Gate",
         "event_url": event_url
     }
-
-PROFILE_FILE = Path("user_profile.json")
-
 
 PROFILE_FILE = Path("user_profile.json")
 
@@ -204,17 +261,77 @@ def decode_email_header(value):
 
 
 def normalize_subject(subject):
-    """Normalize a subject so reply prefixes and Unicode don't break matching."""
-    subject = unicodedata.normalize("NFKC", subject)
-    subject = subject.replace("\xa0", " ").strip()
+    """Normalize email subjects so normal reply/forward prefixes do not break matching."""
+    subject = unicodedata.normalize("NFKC", subject or "")
+    subject = subject.replace("\xa0", " " ).strip()
 
-    lowered = subject.lower()
+    # Remove one or more common reply/forward prefixes, e.g.
+    # Re:, RE:, Fwd:, FW:, Re: Re:
+    subject = re.sub(
+        r"^(?:(?:re|fw|fwd)\s*:\s*)+",
+        "",
+        subject,
+        flags=re.IGNORECASE
+    )
 
-    # Remove common reply prefix
-    if lowered.startswith("re:"):
-        subject = subject[3:].strip()
+    return " ".join(subject.split()).strip()
 
-    return subject
+
+def extract_accessly_reference(subject):
+    """Return the stable [Accessly ...] thread marker when present."""
+    match = re.search(
+        r"\[Accessly\s+[^\]]+\]",
+        subject or "",
+        flags=re.IGNORECASE
+    )
+    return match.group(0).casefold() if match else None
+
+
+def extract_email_body(msg):
+    """Prefer text/plain, with a safe text/html fallback for HTML-only replies."""
+
+    plain_parts = []
+    html_parts = []
+
+    parts = msg.walk() if msg.is_multipart() else [msg]
+
+    for part in parts:
+        content_disposition = (part.get("Content-Disposition") or "").lower()
+
+        if "attachment" in content_disposition:
+            continue
+
+        content_type = part.get_content_type()
+
+        if content_type not in ("text/plain", "text/html"):
+            continue
+
+        payload = part.get_payload(decode=True)
+
+        if not payload:
+            continue
+
+        text = payload.decode(
+            part.get_content_charset() or "utf-8",
+            errors="replace"
+        )
+
+        if content_type == "text/plain":
+            plain_parts.append(text)
+        else:
+            html_parts.append(text)
+
+    if plain_parts:
+        return "\n".join(plain_parts).strip()
+
+    if html_parts:
+        html_text = "\n".join(html_parts)
+        html_text = re.sub(r"<br\s*/?>", "\n", html_text, flags=re.IGNORECASE)
+        html_text = re.sub(r"</p\s*>", "\n", html_text, flags=re.IGNORECASE)
+        html_text = re.sub(r"<[^>]+>", " ", html_text)
+        return html_lib.unescape(html_text).strip()
+
+    return ""
 
 
 @tool
@@ -234,9 +351,9 @@ def check_organizer_reply(request_id: str):
             "request_id": request_id
         }
 
-    stored_subject = normalize_subject(
-        request_record["email_subject"]
-    )
+    stored_subject_raw = request_record.get("email_subject", "")
+    stored_subject = normalize_subject(stored_subject_raw)
+    stored_reference = extract_accessly_reference(stored_subject_raw)
 
     accessly_email = "".join(
         os.environ["ACCESSLY_EMAIL"].split()
@@ -249,91 +366,98 @@ def check_organizer_reply(request_id: str):
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         mail.login(accessly_email, password)
-        mail.select("inbox")
 
-        # Fast ASCII-only search to avoid UnicodeEncodeError
-        status, messages = mail.search(
-            None,
-            'SUBJECT',
-            '"Accessibility Accommodation Request"'
-        )
+        status, _ = mail.select("inbox")
 
         if status != "OK":
             mail.logout()
             return {
                 "status": "failed",
                 "request_id": request_id,
-                "message": "Could not search inbox."
+                "message": "Could not open the Accessly inbox."
+            }
+
+        # IMPORTANT: do not pre-filter by a hard-coded subject phrase.
+        # Accessly subjects can vary by event and include a unique [Accessly ...]
+        # reference. Search recent inbox messages, then match the real stored
+        # thread subject/reference ourselves.
+        status, messages = mail.search(None, "ALL")
+
+        if status != "OK":
+            mail.logout()
+            return {
+                "status": "failed",
+                "request_id": request_id,
+                "message": "Could not search the Accessly inbox."
             }
 
         email_ids = messages[0].split()
 
-        if not email_ids:
-            mail.logout()
-            return {
-                "status": "no_reply",
-                "request_id": request_id
-            }
+        # A recent reply should be near the end. Limiting the scan avoids walking
+        # a very large mailbox while still being much more robust than the old
+        # hard-coded SUBJECT search.
+        recent_email_ids = email_ids[-500:]
 
-        # Newest matching messages first
-        for email_id in reversed(email_ids):
+        for email_id in reversed(recent_email_ids):
 
-            # Fetch headers only first — much faster
             status, header_data = mail.fetch(
                 email_id,
                 "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
             )
 
-            if status != "OK":
+            if status != "OK" or not header_data or not header_data[0]:
                 continue
 
             header_bytes = header_data[0][1]
+
+            if not header_bytes:
+                continue
+
             header_msg = email.message_from_bytes(header_bytes)
 
             subject = decode_email_header(
                 header_msg.get("Subject", "")
             )
 
-            if normalize_subject(subject) != stored_subject:
+            sender = decode_email_header(
+                header_msg.get("From", "")
+            )
+
+            sender_email = parseaddr(sender)[1].strip().casefold()
+
+            # Ignore messages from Accessly itself if any happen to be present.
+            if sender_email == accessly_email.casefold():
                 continue
 
-            # Only now fetch the full matching email
+            received_reference = extract_accessly_reference(subject)
+
+            if stored_reference:
+                # Best match: the stable Accessly reference survives normal
+                # Re:/Fwd: prefixes and small subject edits.
+                if received_reference != stored_reference:
+                    continue
+            else:
+                # Backward-compatible fallback for older request records that
+                # were created before Accessly references were added.
+                if normalize_subject(subject).casefold() != stored_subject.casefold():
+                    continue
+
+            # Fetch the complete message only after the thread matches.
             status, msg_data = mail.fetch(
                 email_id,
                 "(RFC822)"
             )
 
-            if status != "OK":
+            if status != "OK" or not msg_data or not msg_data[0]:
                 continue
 
             raw_email = msg_data[0][1]
+
+            if not raw_email:
+                continue
+
             msg = email.message_from_bytes(raw_email)
-
-            sender = decode_email_header(
-                msg.get("From", "")
-            )
-
-            body = ""
-
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        payload = part.get_payload(decode=True)
-
-                        if payload:
-                            body = payload.decode(
-                                part.get_content_charset() or "utf-8",
-                                errors="replace"
-                            )
-                            break
-            else:
-                payload = msg.get_payload(decode=True)
-
-                if payload:
-                    body = payload.decode(
-                        msg.get_content_charset() or "utf-8",
-                        errors="replace"
-                    )
+            body = extract_email_body(msg)
 
             mail.logout()
 
@@ -342,14 +466,15 @@ def check_organizer_reply(request_id: str):
                 "request_id": request_id,
                 "from": sender,
                 "subject": subject,
-                "body": body.strip()
+                "body": body
             }
 
         mail.logout()
 
         return {
             "status": "no_reply",
-            "request_id": request_id
+            "request_id": request_id,
+            "checked_messages": len(recent_email_ids)
         }
 
     except Exception as e:
@@ -359,6 +484,7 @@ def check_organizer_reply(request_id: str):
             "error_type": type(e).__name__,
             "error": str(e)
         }
+
 
 @tool
 def confirm_accommodation(request_id: str):
@@ -443,10 +569,6 @@ def create_request_record(
         "status": "created",
         "request": record
     }
-    requests.append(record)
-    save_requests(requests)
-
-    return record
 
 @tool
 def update_request_status(
@@ -482,6 +604,7 @@ def update_request_status(
 agent = Agent(
     tools=[
     get_user_accessibility_needs,
+    research_event,
     check_event_timing,
     browser.browser,
     send_accommodation_email,
@@ -498,16 +621,61 @@ official next step.
 
 Use get_user_accessibility_needs to retrieve the user's saved accessibility needs.
 
-Use the browser tool to inspect the official event webpage provided by the user.
+Use research_event as the PRIMARY way to inspect an event URL and collect
+official event/accessibility evidence.
+
+research_event may return:
+- primary_source: the content retrieved from the exact event URL
+- related_sources: relevant pages discovered from official links or
+  official-domain search
+- retrieval_methods: how the evidence was obtained
+- errors: retrieval problems encountered
+
+Treat primary_source and related_sources as evidence returned by a tool.
+
+Use the browser tool only as a FALLBACK when:
+- research_event returns status other than "success"
+- a relevant page could not be accessed by research_event
+- an accommodation form or other interactive page must be inspected or filled
+- user interaction with a webpage is actually required
+
+Do not reopen the same event page with the browser merely to duplicate or
+re-check evidence that research_event already retrieved successfully.
+
+
+WEB RESEARCH CALL RULES
+
+For each event analysis:
+
+- Call research_event EXACTLY ONCE.
+- Pass only the ORIGINAL event URL supplied by the user.
+- Never call research_event again with a URL returned by research_event.
+- Do not call research_event separately for venue, Plan Your Visit, contact,
+  registration, accessibility, or accommodation-form links discovered in the result.
+- research_event already performs official linked-page inspection and an
+  official-domain search fallback when needed.
+- If research_event returns status="success", treat the returned evidence as
+  the completed research package for that event.
+- Use the browser only when research_event failed, or when an interactive form/page
+  must actually be inspected or filled.
+- Never claim that the entire official website was checked. If no accessibility
+  evidence is found, say: "No explicit evidence was found in the official pages
+  retrieved and checked."
 
 
 YOUR WORKFLOW
 
 1. Retrieve the user's saved accessibility needs.
 
-2. Inspect the official event webpage.
+2. Call research_event on the exact event URL provided by the user.
 
-3. Identify, when available:
+3. Review the primary_source and any related_sources returned by research_event.
+
+4. If research_event failed to access relevant information, use the browser
+   as a fallback for the inaccessible page. If research_event succeeded,
+   do not use the browser unless an interactive form or page must be inspected.
+
+5. Identify, when available:
    - event name
    - event date and time
    - location
@@ -516,21 +684,30 @@ YOUR WORKFLOW
    - official accommodation request process
    - official accessibility or organizer contact information
 
-4. Compare every saved accessibility need against what is explicitly confirmed
-   on the official event webpage.
+6. Compare every saved accessibility need against what is explicitly confirmed
+   by the evidence returned from the exact event page or relevant official sources.
 
-5. Classify each need as:
+7. Classify each need as:
    - CONFIRMED: explicitly supported by official information
-   - NOT CONFIRMED: not explicitly stated
-   - UNKNOWN: the relevant information could not be accessed or verified
+   - NOT CONFIRMED: the official event information was successfully accessed,
+     but that specific accommodation was not explicitly confirmed
+   - UNKNOWN: the relevant source or information could not be accessed or
+     reliably verified
 
-6. If one or more required accommodations are not confirmed:
-   - look for an official accommodation form
+Do not classify a need as UNKNOWN merely because research_event found no
+accessibility statement. If research_event successfully accessed the official
+event information but found no explicit evidence for that need, use
+NOT CONFIRMED.
+
+8. If one or more required accommodations are not confirmed:
+   - inspect the evidence returned by research_event for an official
+     accommodation form
    - accessibility page
    - accessibility email
-   - or organizer contact listed on the official event page
+   - or organizer contact
+   - use the browser only when an interactive page or form needs inspection
 
-7. If an official accommodation form exists:
+9. If an official accommodation form exists:
 open and inspect the form
 identify all required fields
 use verified event information when filling event-related fields
@@ -547,9 +724,9 @@ If authentication prevents access to the form:
 report the inaccessible fields as UNKNOWN
 look for an official alternative contact method
 
-8. If the primary accommodation channel cannot be accessed and an official
-   alternative contact method is available on the event page, use that
-   verified alternative as the next available path.
+10. If the primary accommodation channel cannot be accessed and an official
+    alternative contact method is available in the verified evidence, use that
+    verified alternative as the next available path.
 
 
 EVIDENCE AND HALLUCINATION RULES
@@ -603,8 +780,12 @@ If the official source says words such as:
 
 describe the period as a preferred or recommended notice window.
 
-Do NOT call it a deadline unless the official source explicitly states
-that it is mandatory.
+If the source instead says wording such as "at least one week prior" or
+"requests must be submitted X days before", preserve that wording and do NOT
+relabel it as merely preferred unless the source itself says so.
+
+Do NOT call it a hard deadline unless the official source explicitly states
+that requests after that date are not accepted.
 
 If preferred_window_passed is true, state that the request is being made
 after or outside the preferred notice period.
@@ -757,10 +938,12 @@ check_organizer_reply using the request_id, for example REQ-001.
 
 Do not use the request ID itself as an email subject search term.
 
-check_organizer_reply resolves the stored email subject
-from the request record automatically.
+check_organizer_reply resolves the stored email thread from the request record
+automatically, including the Accessly reference when present.
 
-If no reply is found, report that the request remains pending.
+If no reply is found, report that the request remains pending. Do not claim that
+the inbox contains no reply in general; only say that no matching reply was found
+for that tracked request.
 
 If a reply is found:
 1. read the organizer's response carefully
@@ -892,6 +1075,4 @@ if __name__ == "__main__":
             print("\nAccessly encountered an error.")
             print("Error type:", type(e).__name__)
             print("Error:", str(e))
-
-
 
