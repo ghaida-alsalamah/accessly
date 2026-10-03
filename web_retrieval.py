@@ -138,6 +138,14 @@ POSITIVE_PATH_HINTS = {
     "getting-here": 7,
     "venue-info": 7,
     "facilities": 7,
+    "show-info": 8,
+    "show-information": 8,
+    "event-info": 7,
+    "event-information": 7,
+    "opening-hours": 8,
+    "schedule": 6,
+    "agenda": 5,
+    "when-where": 7,
     "sustainability": 3,
     "help": 4,
     "support": 4,
@@ -381,6 +389,118 @@ def has_contact_signal(text: str) -> bool:
 
 
 
+YEAR_RE = re.compile(r"\b(20[1-3]\d)\b")
+TIME_RE = re.compile(
+    r"\b(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:a\.?m\.?|p\.?m\.?)\b"
+    r"|\b(?:[01]?\d|2[0-3]):[0-5]\d\b",
+    flags=re.I,
+)
+MONTH_RE = re.compile(
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\b",
+    flags=re.I,
+)
+
+
+def extract_years(text: str) -> list[int]:
+    """Return distinct plausible calendar years in first-occurrence order."""
+    seen = set()
+    years = []
+    for match in YEAR_RE.finditer(text or ""):
+        year = int(match.group(1))
+        if year not in seen:
+            seen.add(year)
+            years.append(year)
+    return years
+
+
+def infer_event_year(markdown: str, title: str = "") -> int | None:
+    """Infer an event-year hint from the exact event page for evidence ranking."""
+    title_years = extract_years(title)
+    if title_years:
+        return title_years[0]
+
+    lines = (markdown or "").splitlines()[:180]
+    for line in lines:
+        low = normalize_text(line)
+        if MONTH_RE.search(line) or any(k in low for k in ("date", "event date", "when")):
+            years = extract_years(line)
+            if years:
+                return years[0]
+
+    top_years = extract_years("\n".join(lines))
+    return top_years[0] if top_years else None
+
+
+def year_relevance(text: str, event_year: int | None) -> tuple[list[int], str]:
+    """Describe source-year relevance without discarding any official evidence."""
+    years = extract_years(text)
+    if event_year is None:
+        return years, "event_year_unknown"
+    if not years:
+        return years, "undated_or_not_year_specific"
+    if event_year in years:
+        return years, "matches_event_year"
+    if max(years) < event_year:
+        return years, "older_year_only"
+    if min(years) > event_year:
+        return years, "newer_year_only"
+    return years, "other_years_only"
+
+
+def extract_event_fact_snippets(markdown: str) -> dict[str, list[str]]:
+    """Keep compact fact windows from full text before markdown truncation."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in (markdown or "").splitlines()]
+    categories: dict[str, list[str]] = {
+        "time": [], "date": [], "location": [], "organizer": [], "contact": []
+    }
+    seen: dict[str, set[str]] = {key: set() for key in categories}
+
+    def add(kind: str, idx: int):
+        if len(categories[kind]) >= 6:
+            return
+        start = max(0, idx - 1)
+        end = min(len(lines), idx + 2)
+        window = " | ".join(x for x in lines[start:end] if x)[:700]
+        key = normalize_text(window)
+        if window and key not in seen[kind]:
+            seen[kind].add(key)
+            categories[kind].append(window)
+
+    for idx, line in enumerate(lines):
+        if not line:
+            continue
+        low = normalize_text(line)
+        if TIME_RE.search(line) or any(k in low for k in ("opening hours", "show hours", "event hours", "timings", "time:")):
+            add("time", idx)
+        if (MONTH_RE.search(line) and YEAR_RE.search(line)) or any(k in low for k in ("event date", "date:")):
+            add("date", idx)
+        if any(k in low for k in ("location", "venue", "address", "getting here", "where:")):
+            add("location", idx)
+        if any(k in low for k in ("organised by", "organized by", "hosted by", "presented by", "event organiser", "event organizer")):
+            add("organizer", idx)
+        if ("@" in line or re.search(r"\+[0-9][0-9() .-]{7,}[0-9]", line)
+                or any(k in low for k in ("contact us", "whatsapp", "general enquiries", "general inquiries", "customer service"))):
+            add("contact", idx)
+
+    return categories
+
+
+def annotate_page_year_context(page: dict, event_year: int | None) -> dict:
+    """Attach edition/freshness hints to a scraped official page.
+
+    Use the title and leading content rather than the whole page so a footer
+    copyright year does not make an older event-edition page look current.
+    """
+    leading = str(page.get("markdown", ""))[:7000]
+    combined = f"{page.get('title', '')}\n{leading}"
+    years, relevance = year_relevance(combined, event_year)
+    page["years_mentioned"] = years
+    page["year_relevance"] = relevance
+    return page
+
+
 def extract_contact_candidates(markdown: str, links: list[str], source_url: str) -> list[dict]:
     """Extract official contact/form candidates with nearby source context.
 
@@ -448,6 +568,8 @@ def page_role(url: str, primary_url: str) -> str:
         return "accessibility_or_accommodation_page"
     if "contact" in low or "enquir" in low or "inquir" in low:
         return "contact_page"
+    if any(x in low for x in ("show-info", "show-information", "event-info", "event-information", "opening-hours", "schedule", "agenda", "when-where")):
+        return "event_information_page"
     if "faq" in low:
         return "faq_page"
     if any(x in low for x in ("venue", "visit", "travel", "getting-here", "facilities")):
@@ -577,6 +699,11 @@ def scrape_page(
                 markdown
             ),
 
+        # Extract from FULL markdown so facts near the bottom of long pages are
+        # not lost when the returned markdown is truncated.
+        "event_fact_snippets":
+            extract_event_fact_snippets(markdown),
+
         "contact_candidates":
             extract_contact_candidates(
                 markdown,
@@ -657,6 +784,26 @@ def select_primary_links(
             selected[-1] = contact_candidates[0]
         else:
             selected.append(contact_candidates[0])
+
+    # Preserve one schedule/show-information style page when available so event
+    # hours are not crowded out by several accessibility/venue links.
+    timing_candidates = [
+        url for _, url in candidates
+        if any(token in url.lower() for token in (
+            'show-info', 'show-information', 'event-info', 'event-information',
+            'opening-hours', 'schedule', 'agenda', 'when-where'
+        ))
+    ]
+    if timing_candidates and not any(url in selected for url in timing_candidates):
+        if len(selected) >= MAX_LINKED_PAGES:
+            # Replace the lowest-ranked selected link only if it is not the
+            # dedicated contact page we intentionally preserved above.
+            replace_index = len(selected) - 1
+            if selected[replace_index] in contact_candidates and len(selected) > 1:
+                replace_index -= 1
+            selected[replace_index] = timing_candidates[0]
+        else:
+            selected.append(timing_candidates[0])
 
     return selected
 
@@ -862,6 +1009,8 @@ def research_event(
         # Deterministically extracted channels from official pages. These are
         # candidates, not automatically accessibility-specific contacts.
         "contact_candidates": [],
+        "preferred_contact_candidates": [],
+        "event_year_hint": None,
     }
 
     # -----------------------------------------------------
@@ -910,6 +1059,9 @@ def research_event(
         "event_name"
     ] = event_name
 
+    event_year_hint = infer_event_year(primary.get("markdown", ""), primary.get("title", ""))
+    result["event_year_hint"] = event_year_hint
+    annotate_page_year_context(primary, event_year_hint)
     primary["source_role"] = "exact_event_page"
 
     result[
@@ -920,6 +1072,8 @@ def research_event(
         enriched = dict(candidate)
         enriched["source_role"] = "exact_event_page"
         enriched["priority"] = 1
+        enriched["source_year_relevance"] = primary.get("year_relevance")
+        enriched["source_years"] = primary.get("years_mentioned", [])
         result["contact_candidates"].append(enriched)
 
     if primary["url"] not in result["pages_checked"]:
@@ -979,11 +1133,13 @@ def research_event(
         if page["url"] not in result["pages_checked"]:
             result["pages_checked"].append(page["url"])
 
+        annotate_page_year_context(page, event_year_hint)
         role = page_role(page["url"], event_url)
         page["source_role"] = role
         priority = {
             "accessibility_or_accommodation_page": 2,
             "contact_page": 3,
+            "event_information_page": 3,
             "faq_page": 3,
             "venue_or_visit_page": 3,
             "related_official_page": 4,
@@ -992,6 +1148,8 @@ def research_event(
             enriched = dict(candidate)
             enriched["source_role"] = role
             enriched["priority"] = priority
+            enriched["source_year_relevance"] = page.get("year_relevance")
+            enriched["source_years"] = page.get("years_mentioned", [])
             result["contact_candidates"].append(enriched)
 
         # Keep accessibility/request evidence plus official contact pages.
@@ -999,6 +1157,7 @@ def research_event(
             page["has_accessibility_signal"]
             or page["has_request_signal"]
             or page["has_contact_signal"]
+            or any(page.get("event_fact_snippets", {}).values())
         ):
             result["related_sources"].append(page)
 
@@ -1132,6 +1291,7 @@ def research_event(
             if page["url"] not in result["pages_checked"]:
                 result["pages_checked"].append(page["url"])
 
+            annotate_page_year_context(page, event_year_hint)
             role = page_role(page["url"], event_url)
             page["source_role"] = role
             priority = {
@@ -1145,21 +1305,38 @@ def research_event(
                 enriched = dict(contact)
                 enriched["source_role"] = role
                 enriched["priority"] = priority
+                enriched["source_year_relevance"] = page.get("year_relevance")
+                enriched["source_years"] = page.get("years_mentioned", [])
                 result["contact_candidates"].append(enriched)
 
             if (
                 page["has_accessibility_signal"]
                 or page["has_request_signal"]
                 or page["has_contact_signal"]
+                or any(page.get("event_fact_snippets", {}).values())
             ):
                 result["related_sources"].append(page)
 
-    # Deduplicate contact candidates and put event-specific evidence first.
+    # Deduplicate contacts and rank event-specific/current official evidence
+    # ahead of older-edition hits. Older candidates remain visible as evidence.
+    year_rank = {
+        "matches_event_year": 0,
+        "undated_or_not_year_specific": 1,
+        "event_year_unknown": 1,
+        "other_years_only": 2,
+        "newer_year_only": 2,
+        "older_year_only": 4,
+    }
     deduped_contacts = []
     seen_contacts = set()
     for candidate in sorted(
         result["contact_candidates"],
-        key=lambda item: (item.get("priority", 9), item.get("type", ""), item.get("value", ""))
+        key=lambda item: (
+            item.get("priority", 9),
+            year_rank.get(item.get("source_year_relevance"), 3),
+            item.get("type", ""),
+            item.get("value", ""),
+        )
     ):
         key = (candidate.get("type"), str(candidate.get("value", "")).casefold())
         if key in seen_contacts:
@@ -1167,6 +1344,12 @@ def research_event(
         seen_contacts.add(key)
         deduped_contacts.append(candidate)
     result["contact_candidates"] = deduped_contacts[:20]
+
+    preferred = [
+        c for c in deduped_contacts
+        if c.get("source_year_relevance") != "older_year_only"
+    ]
+    result["preferred_contact_candidates"] = (preferred or deduped_contacts)[:8]
 
     result[
         "status"
@@ -1177,7 +1360,11 @@ def research_event(
     result["tool_guidance"] = (
         "Research for this event is complete. "
         "Do not call research_event again for links discovered in this result. "
-        "Use the returned primary_source, related_sources, and pages_checked. "
+        "Use primary_source, related_sources, event_fact_snippets, and pages_checked. "
+        "Before saying a time or contact is not stated, inspect event_fact_snippets and "
+        "preferred_contact_candidates. Prefer exact-event/current or undated official evidence "
+        "over older_year_only evidence. Older-year-only evidence may describe a prior edition "
+        "and must not silently be presented as current. "
         "Only use the browser if retrieval failed or interactive form inspection is required."
     )
 

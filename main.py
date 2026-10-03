@@ -53,11 +53,18 @@ def research_event(event_url: str):
             result = deepcopy(result)
             result.setdefault("cache_hit", False)
             result["research_complete"] = result.get("status") == "success"
-            result["tool_guidance"] = (
+            retrieval_guidance = str(result.get("tool_guidance") or "").strip()
+            wrapper_guidance = (
                 "Event web research is complete for this URL. Do not call "
                 "research_event again for links discovered in this result. "
                 "Use the returned evidence. Use the browser only for an "
                 "interactive form/page or when retrieval failed."
+            )
+            # Preserve retrieval-layer guidance instead of replacing it. The
+            # retrieval layer may provide important source-freshness and fact
+            # extraction hints for long or recurring event pages.
+            result["tool_guidance"] = " ".join(
+                part for part in (retrieval_guidance, wrapper_guidance) if part
             )
 
             if result.get("status") == "success":
@@ -871,14 +878,19 @@ or website platform. If an official source explicitly says "organized by", "orga
 "hosted by", or equivalent, that explicit statement wins.
 
 Do not report "Not stated by the organizer" for time, organizer, format, or contact if
-any retrieved official source explicitly provides that field. Before finalizing the report,
-scan primary_source and all related_sources for those fields.
+any retrieved official source explicitly provides that field. Before finalizing the report:
+- scan primary_source and all related_sources
+- inspect each page's event_fact_snippets, especially time/date/contact snippets
+- inspect preferred_contact_candidates before saying no official contact was found
 
-If multiple official pages conflict, prefer the most event-specific and current source,
-and mention the conflict when it materially affects the user's decision. Do not silently
-combine facts from different event editions. If an accessibility page is explicitly
-year-specific to an older edition, do not present it as confirmed for the current edition
-without saying that the evidence is from the older edition.
+The retrieval layer may return event_year_hint plus year_relevance on each source. Treat
+these as ranking hints, not as final facts. If multiple official pages conflict, prefer the
+most event-specific and current source. An exact-event or current/undated official source
+should normally outrank an older_year_only source. Do not silently combine facts from
+different event editions. If a source is explicitly tied only to an older edition, do not
+present its accessibility provision, time, deadline, or contact as current unless a current
+official source corroborates it. If it is the only evidence available, state that it belongs
+to an older edition rather than silently treating it as current.
 
 
 SOURCE AND CONTACT PRIORITY
@@ -889,7 +901,14 @@ this order:
 2. event-specific accessibility contact or accommodation form
 3. event-specific organizer contact
 4. site-wide accessibility/disability office guidance
-5. general organization or communications contact
+5. current general organization or communications contact
+
+Use preferred_contact_candidates as the first contact shortlist, then consult the full
+contact_candidates list only when needed. A candidate from an older_year_only source
+should not outrank a current or undated official contact merely because it appears in a
+search result. Also inspect each candidate's context: do not choose a phone/email that
+belongs to a sponsor, exhibitor, speaker, unrelated department, or historical campaign
+unless the surrounding official text shows it is an appropriate contact for this event.
 
 Do not describe a general communications or organizer email as an accessibility
 contact unless the source explicitly says it handles accessibility or accommodation
@@ -899,8 +918,8 @@ requests. Label the contact type accurately in the report, for example:
 - General organization contact
 
 If two official sources give different accommodation instructions, use the more
-event-specific instruction and mention the broader instruction only as secondary
-context. Do not silently merge conflicting deadlines or contacts.
+event-specific and current instruction and mention the broader instruction only as
+secondary context. Do not silently merge conflicting deadlines or contacts.
 
 
 RECOMMENDED ACTION RULES
