@@ -143,6 +143,12 @@ POSITIVE_PATH_HINTS = {
     "event-info": 7,
     "event-information": 7,
     "opening-hours": 8,
+    "show-dates": 8,
+    "show-times": 8,
+    "visitor-information": 8,
+    "visitor-info": 8,
+    "planning-preparation": 8,
+    "why-visit": 7,
     "schedule": 6,
     "agenda": 5,
     "when-where": 7,
@@ -472,7 +478,11 @@ def extract_event_fact_snippets(markdown: str) -> dict[str, list[str]]:
         if not line:
             continue
         low = normalize_text(line)
-        if TIME_RE.search(line) or any(k in low for k in ("opening hours", "show hours", "event hours", "timings", "time:")):
+        if TIME_RE.search(line) or any(k in low for k in (
+            "opening hours", "show hours", "event hours", "event timings",
+            "show timings", "visiting hours", "visitor hours", "opening times",
+            "show times", "timings", "time:"
+        )):
             add("time", idx)
         if (MONTH_RE.search(line) and YEAR_RE.search(line)) or any(k in low for k in ("event date", "date:")):
             add("date", idx)
@@ -568,7 +578,12 @@ def page_role(url: str, primary_url: str) -> str:
         return "accessibility_or_accommodation_page"
     if "contact" in low or "enquir" in low or "inquir" in low:
         return "contact_page"
-    if any(x in low for x in ("show-info", "show-information", "event-info", "event-information", "opening-hours", "schedule", "agenda", "when-where")):
+    if any(x in low for x in (
+        "show-info", "show-information", "event-info", "event-information",
+        "opening-hours", "show-dates", "show-times", "visitor-information",
+        "visitor-info", "planning-preparation", "why-visit", "schedule",
+        "agenda", "when-where"
+    )):
         return "event_information_page"
     if "faq" in low:
         return "faq_page"
@@ -791,7 +806,9 @@ def select_primary_links(
         url for _, url in candidates
         if any(token in url.lower() for token in (
             'show-info', 'show-information', 'event-info', 'event-information',
-            'opening-hours', 'schedule', 'agenda', 'when-where'
+            'opening-hours', 'show-dates', 'show-times', 'visitor-information',
+            'visitor-info', 'planning-preparation', 'why-visit', 'schedule',
+            'agenda', 'when-where'
         ))
     ]
     if timing_candidates and not any(url in selected for url in timing_candidates):
@@ -1317,23 +1334,78 @@ def research_event(
             ):
                 result["related_sources"].append(page)
 
-    # Deduplicate contacts and rank event-specific/current official evidence
-    # ahead of older-edition hits. Older candidates remain visible as evidence.
-    year_rank = {
-        "matches_event_year": 0,
-        "undated_or_not_year_specific": 1,
-        "event_year_unknown": 1,
-        "other_years_only": 2,
-        "newer_year_only": 2,
-        "older_year_only": 4,
+    # Deduplicate and rank contacts using generalized provenance signals.
+    # A dedicated current contact/accessibility page may be more authoritative
+    # than a generic widget on the event homepage, while an event-specific
+    # channel still outranks unrelated organization-wide contacts.
+    year_score = {
+        "matches_event_year": 40,
+        "undated_or_not_year_specific": 28,
+        "event_year_unknown": 24,
+        "other_years_only": 5,
+        "newer_year_only": 0,
+        "older_year_only": -80,
     }
+    role_score = {
+        "accessibility_or_accommodation_page": 55,
+        "contact_page": 48,
+        "exact_event_page": 45,
+        "event_information_page": 36,
+        "faq_page": 30,
+        "venue_or_visit_page": 28,
+        "related_official_page": 18,
+    }
+
+    def contact_context_score(candidate: dict) -> int:
+        text = normalize_text(
+            f"{candidate.get('context', '')} {candidate.get('source_url', '')}"
+        )
+        score = 0
+        if any(x in text for x in (
+            "accessibility", "accommodation", "disability", "special assistance"
+        )):
+            score += 45
+        if any(x in text for x in (
+            "visitor enquiries", "visitor inquiries", "attendee", "customer service",
+            "event enquiries", "event inquiries", "contact us", "general enquiries",
+            "general inquiries", "whatsapp"
+        )):
+            score += 22
+        if any(x in text for x in (
+            "sponsor", "exhibitor", "speaker", "media enquiry", "media inquiry",
+            "press enquiry", "press inquiry", "careers", "recruitment"
+        )):
+            score -= 70
+        return score
+
+    # Count independent official-page support for each exact channel. Repetition
+    # is only a modest boost; it never rescues an older-edition contact.
+    support_urls: dict[tuple[str, str], set[str]] = {}
+    for candidate in result["contact_candidates"]:
+        key = (candidate.get("type", ""), str(candidate.get("value", "")).casefold())
+        support_urls.setdefault(key, set()).add(str(candidate.get("source_url", "")))
+
+    ranked_contacts = []
+    for candidate in result["contact_candidates"]:
+        key = (candidate.get("type", ""), str(candidate.get("value", "")).casefold())
+        support_count = len(support_urls.get(key, set()))
+        candidate = dict(candidate)
+        candidate["supporting_source_count"] = support_count
+        candidate["ranking_score"] = (
+            year_score.get(candidate.get("source_year_relevance"), 0)
+            + role_score.get(candidate.get("source_role"), 0)
+            + contact_context_score(candidate)
+            + min(max(support_count - 1, 0), 3) * 4
+        )
+        ranked_contacts.append(candidate)
+
     deduped_contacts = []
     seen_contacts = set()
     for candidate in sorted(
-        result["contact_candidates"],
+        ranked_contacts,
         key=lambda item: (
+            -item.get("ranking_score", 0),
             item.get("priority", 9),
-            year_rank.get(item.get("source_year_relevance"), 3),
             item.get("type", ""),
             item.get("value", ""),
         )
@@ -1348,6 +1420,7 @@ def research_event(
     preferred = [
         c for c in deduped_contacts
         if c.get("source_year_relevance") != "older_year_only"
+        and c.get("ranking_score", 0) > -20
     ]
     result["preferred_contact_candidates"] = (preferred or deduped_contacts)[:8]
 
@@ -1361,8 +1434,10 @@ def research_event(
         "Research for this event is complete. "
         "Do not call research_event again for links discovered in this result. "
         "Use primary_source, related_sources, event_fact_snippets, and pages_checked. "
-        "Before saying a time or contact is not stated, inspect event_fact_snippets and "
-        "preferred_contact_candidates. Prefer exact-event/current or undated official evidence "
+        "Before saying a time or contact is not stated, inspect event_fact_snippets from every "
+        "retrieved page and preferred_contact_candidates. For generic contact channels, a current "
+        "dedicated official contact/customer-service page can outrank a homepage widget when its "
+        "context is clearer. Prefer exact-event/current or undated official evidence "
         "over older_year_only evidence. Older-year-only evidence may describe a prior edition "
         "and must not silently be presented as current. "
         "Only use the browser if retrieval failed or interactive form inspection is required."

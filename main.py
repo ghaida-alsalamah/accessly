@@ -881,6 +881,8 @@ Do not report "Not stated by the organizer" for time, organizer, format, or cont
 any retrieved official source explicitly provides that field. Before finalizing the report:
 - scan primary_source and all related_sources
 - inspect each page's event_fact_snippets, especially time/date/contact snippets
+- for time, look for opening hours, show hours, visiting hours, daily timings, schedule,
+  visitor information, and planning/preparation pages; preserve different hours by day
 - inspect preferred_contact_candidates before saying no official contact was found
 
 The retrieval layer may return event_year_hint plus year_relevance on each source. Treat
@@ -899,16 +901,25 @@ When multiple official sources or contact channels are available, prefer them in
 this order:
 1. event-specific accommodation instructions linked from the exact event page
 2. event-specific accessibility contact or accommodation form
-3. event-specific organizer contact
+3. a clearly event-specific organizer/customer-service contact
 4. site-wide accessibility/disability office guidance
-5. current general organization or communications contact
+5. a current dedicated official contact/customer-service page for the event or organizer
+6. another current general organization or communications contact
 
 Use preferred_contact_candidates as the first contact shortlist, then consult the full
-contact_candidates list only when needed. A candidate from an older_year_only source
-should not outrank a current or undated official contact merely because it appears in a
-search result. Also inspect each candidate's context: do not choose a phone/email that
-belongs to a sponsor, exhibitor, speaker, unrelated department, or historical campaign
-unless the surrounding official text shows it is an appropriate contact for this event.
+contact_candidates list only when needed. Treat ranking_score, source_role, year relevance,
+and candidate context as hints together rather than blindly preferring the first contact
+seen on the homepage. A current dedicated Contact / Customer Service page can outrank a
+generic homepage widget when the dedicated page gives a clearer current contact channel.
+A candidate from an older_year_only source should not outrank a current or undated official
+contact merely because it appears in a search result. Also inspect each candidate's context:
+do not choose a phone/email that belongs to a sponsor, exhibitor, speaker, unrelated
+department, or historical campaign unless the surrounding official text shows it is an
+appropriate contact for this event.
+
+The Official contact / form field, the Recommended action, and any email draft must be
+consistent with each other. If the final recommendation or draft uses a verified official
+email/phone/form, do not simultaneously report that no official contact/form was stated.
 
 Do not describe a general communications or organizer email as an accessibility
 contact unless the source explicitly says it handles accessibility or accommodation
@@ -947,6 +958,12 @@ Use this priority unless event_status is PAST:
 For a hybrid event, physical accessibility needs remain applicable because an
 in-person attendance option exists. Only classify physical needs as NOT APPLICABLE
 when the event is fully virtual with no physical attendance option.
+
+If every saved need is NOT APPLICABLE for the event format, do not recommend sending an
+accommodation email or filling an accommodation form for those saved needs. The concrete
+recommended action should say that no accommodation request is needed based on the user's
+current saved needs. You may still report an official accessibility channel as informational
+context if one was verified.
 
 
 EVENT DATE CONSISTENCY

@@ -177,7 +177,15 @@ def _message_contradicts_rows(message: str, rows: list[dict]) -> bool:
     if ('none of' in low or 'none ' in low) and 'confirmed' in low:
         return any(s == 'CONFIRMED' for s in statuses)
     if ('all three' in low or 'all of your' in low or 'all saved' in low) and 'not applicable' in low:
-        return not all(s == 'NOT APPLICABLE' for s in statuses)
+        if not all(s == 'NOT APPLICABLE' for s in statuses):
+            return True
+    if all(s == 'NOT APPLICABLE' for s in statuses):
+        requests_action = any(phrase in low for phrase in (
+            'fill the official', 'submit the official', 'send an accommodation request',
+            'draft an accommodation request', 'request your accommodations'
+        ))
+        if requests_action and 'no accommodation request' not in low:
+            return True
     return False
 
 
@@ -232,6 +240,18 @@ def _is_meta_recommendation(value: str | None) -> bool:
         'tell me how you want to proceed',
     )
     return any(phrase in lowered for phrase in phrases)
+
+def _contact_from_recommendation(value: str | None) -> str | None:
+    """Recover a contact already used in the report's concrete recommendation."""
+    if not value:
+        return None
+    email_match = re.search(r'[^\s<>]+@[^\s<>]+\.[^\s<>]+', value)
+    if email_match:
+        return email_match.group(0).rstrip('.,);]')
+    phone_match = re.search(r'\+[0-9][0-9() .-]{7,}[0-9]', value)
+    if phone_match:
+        return phone_match.group(0).strip().rstrip('.,);]')
+    return None
 
 def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: str | None, previous: dict | None = None) -> dict:
     previous = previous or {}
@@ -318,10 +338,20 @@ def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: st
             action['recommendation'] = normalized(quote)
     if _is_meta_recommendation(action.get('recommendation')):
         action['recommendation'] = None
-    _assisted_form_recommendation(action)
+
+    all_not_applicable = bool(rows) and all(
+        row.get('status') == 'NOT APPLICABLE' for row in rows
+    )
+
+    if not all_not_applicable:
+        _assisted_form_recommendation(action)
+    else:
+        action['recommendation'] = (
+            'No accommodation request is needed based on your current saved needs.'
+        )
 
     draft = None
-    if extracted.draft:
+    if extracted.draft and not all_not_applicable:
         candidate = extracted.draft
         if re.fullmatch(r'[^\s<>]+@[^\s<>]+\.[^\s<>]+', candidate.to) and all(
             normalized(value) and normalized(value) in normalized(report)
@@ -329,6 +359,15 @@ def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: st
         ):
             draft = candidate.model_dump()
             draft['body'] = plain_email(draft['body'])
+
+    # If the same report already uses a verified contact in its recommendation
+    # or draft, keep the displayed Official contact field consistent with it.
+    if not action.get('official_contact'):
+        recovered_contact = draft.get('to') if draft else None
+        if not recovered_contact:
+            recovered_contact = _contact_from_recommendation(action.get('recommendation'))
+        if recovered_contact and normalized(recovered_contact) in normalized(report):
+            action['official_contact'] = recovered_contact
 
     message = extracted.message
     if _message_contradicts_rows(message, rows):
