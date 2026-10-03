@@ -55,12 +55,12 @@ _RESEARCH_CACHE: dict[str, dict] = {}
 # Limits
 # ---------------------------------------------------------
 
-MAX_PRIMARY_CHARS = 18000
-MAX_RELATED_CHARS = 8000
+MAX_PRIMARY_CHARS = 26000
+MAX_RELATED_CHARS = 10000
 
-MAX_LINKED_PAGES = 4
-MAX_SEARCH_PAGES = 3
-SEARCH_RESULT_LIMIT = 8
+MAX_LINKED_PAGES = 5
+MAX_SEARCH_PAGES = 4
+SEARCH_RESULT_LIMIT = 10
 
 
 # ---------------------------------------------------------
@@ -380,6 +380,81 @@ def has_contact_signal(text: str) -> bool:
     ])
 
 
+
+def extract_contact_candidates(markdown: str, links: list[str], source_url: str) -> list[dict]:
+    """Extract official contact/form candidates with nearby source context.
+
+    These are evidence candidates only. The agent still decides whether a channel
+    is accessibility-specific, event-specific, or merely general.
+    """
+    candidates: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    text = markdown or ""
+
+    def add(kind: str, value: str, context: str = ""):
+        clean_value = value.strip().rstrip('.,);]')
+        key = (kind, clean_value.casefold())
+        if not clean_value or key in seen:
+            return
+        seen.add(key)
+        candidates.append({
+            "type": kind,
+            "value": clean_value,
+            "source_url": source_url,
+            "context": re.sub(r"\s+", " ", context).strip()[:500],
+        })
+
+    # Email addresses with nearby words so the agent can label their purpose.
+    for match in re.finditer(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, flags=re.I):
+        left = max(0, match.start() - 220)
+        right = min(len(text), match.end() + 220)
+        add("email", match.group(0), text[left:right])
+
+    # International-style phone numbers. Require a leading + to avoid dates and IDs.
+    for match in re.finditer(r"\+[0-9][0-9() .-]{7,}[0-9]", text):
+        left = max(0, match.start() - 180)
+        right = min(len(text), match.end() + 180)
+        add("phone", match.group(0), text[left:right])
+
+    # Form-like links, including trusted external form platforms linked by the
+    # official event page. Being linked does not itself prove accessibility use;
+    # the surrounding page text remains the evidence for that classification.
+    for link in links or []:
+        low = (link or "").lower()
+        if not link:
+            continue
+        if any(token in low for token in (
+            "docs.google.com/forms",
+            "forms.gle",
+            "forms.office.com",
+            "formstack.com",
+            "jotform.com",
+            "/form/",
+            "/forms/",
+            "accommodation",
+            "accessibility-request",
+        )):
+            add("form", link, "Linked from this official source page")
+
+    return candidates
+
+
+def page_role(url: str, primary_url: str) -> str:
+    """Give the agent a simple source-role hint without making a verdict."""
+    if url.rstrip('/') == primary_url.rstrip('/'):
+        return "exact_event_page"
+    low = url.lower()
+    if "accessib" in low or "accommodation" in low:
+        return "accessibility_or_accommodation_page"
+    if "contact" in low or "enquir" in low or "inquir" in low:
+        return "contact_page"
+    if "faq" in low:
+        return "faq_page"
+    if any(x in low for x in ("venue", "visit", "travel", "getting-here", "facilities")):
+        return "venue_or_visit_page"
+    return "related_official_page"
+
+
 def extract_event_name(
     markdown: str,
     title: str,
@@ -501,6 +576,13 @@ def scrape_page(
             has_contact_signal(
                 markdown
             ),
+
+        "contact_candidates":
+            extract_contact_candidates(
+                markdown,
+                list(links)[:100],
+                document_url(document) or url
+            ),
     }
 
 
@@ -548,46 +630,35 @@ def select_primary_links(
 ) -> list[str]:
 
     candidates = []
-
-    seen = {
-        primary_url.rstrip("/")
-    }
+    seen = {primary_url.rstrip("/")}
 
     for url in links:
-
-        normalized = url.rstrip("/")
-
-        if normalized in seen:
+        normalized_url = url.rstrip("/")
+        if normalized_url in seen:
             continue
+        seen.add(normalized_url)
 
-        seen.add(normalized)
-
-        score = score_link(
-            url,
-            official_domain
-        )
-
+        score = score_link(url, official_domain)
         if score <= 0:
             continue
+        candidates.append((score, url))
 
-        candidates.append(
-            (
-                score,
-                url
-            )
-        )
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    selected = [url for _, url in candidates[:MAX_LINKED_PAGES]]
 
-    candidates.sort(
-        key=lambda item: item[0],
-        reverse=True
-    )
-
-    return [
-        url
-        for _, url in candidates[
-            :MAX_LINKED_PAGES
-        ]
+    # Preserve source diversity. Contact pages can otherwise lose to several
+    # high-scoring venue/accessibility pages even though the request path matters.
+    contact_candidates = [
+        url for _, url in candidates
+        if any(token in url.lower() for token in ('contact', 'enquir', 'inquir', 'support', 'help'))
     ]
+    if contact_candidates and not any(url in selected for url in contact_candidates):
+        if len(selected) >= MAX_LINKED_PAGES:
+            selected[-1] = contact_candidates[0]
+        else:
+            selected.append(contact_candidates[0])
+
+    return selected
 
 
 # ---------------------------------------------------------
@@ -606,11 +677,12 @@ def search_official_domain(
     )[:120]
 
     # ONE bounded official-domain search. Do not require the event name because
-    # venue/accessibility/contact pages often omit it entirely.
+    # venue/accessibility/contact pages often omit it entirely. Event-name overlap
+    # is applied later as a ranking boost instead of a hard search constraint.
     query = (
         f'site:{official_domain} '
-        f'accessibility wheelchair "step free" ramps elevators '
-        f'accommodations disability venue contact'
+        f'accessibility accommodations contact venue wheelchair '
+        f'"step free" ramps elevators captions'
     )
 
     result = firecrawl.search(
@@ -786,6 +858,10 @@ def research_event(
         "retrieval_complete": False,
 
         "pages_checked": [],
+
+        # Deterministically extracted channels from official pages. These are
+        # candidates, not automatically accessibility-specific contacts.
+        "contact_candidates": [],
     }
 
     # -----------------------------------------------------
@@ -834,9 +910,17 @@ def research_event(
         "event_name"
     ] = event_name
 
+    primary["source_role"] = "exact_event_page"
+
     result[
         "primary_source"
     ] = primary
+
+    for candidate in primary.get("contact_candidates", []):
+        enriched = dict(candidate)
+        enriched["source_role"] = "exact_event_page"
+        enriched["priority"] = 1
+        result["contact_candidates"].append(enriched)
 
     if primary["url"] not in result["pages_checked"]:
         result["pages_checked"].append(primary["url"])
@@ -894,6 +978,21 @@ def research_event(
 
         if page["url"] not in result["pages_checked"]:
             result["pages_checked"].append(page["url"])
+
+        role = page_role(page["url"], event_url)
+        page["source_role"] = role
+        priority = {
+            "accessibility_or_accommodation_page": 2,
+            "contact_page": 3,
+            "faq_page": 3,
+            "venue_or_visit_page": 3,
+            "related_official_page": 4,
+        }.get(role, 4)
+        for candidate in page.get("contact_candidates", []):
+            enriched = dict(candidate)
+            enriched["source_role"] = role
+            enriched["priority"] = priority
+            result["contact_candidates"].append(enriched)
 
         # Keep accessibility/request evidence plus official contact pages.
         if (
@@ -1033,12 +1132,41 @@ def research_event(
             if page["url"] not in result["pages_checked"]:
                 result["pages_checked"].append(page["url"])
 
+            role = page_role(page["url"], event_url)
+            page["source_role"] = role
+            priority = {
+                "accessibility_or_accommodation_page": 2,
+                "contact_page": 3,
+                "faq_page": 3,
+                "venue_or_visit_page": 3,
+                "related_official_page": 4,
+            }.get(role, 4)
+            for contact in page.get("contact_candidates", []):
+                enriched = dict(contact)
+                enriched["source_role"] = role
+                enriched["priority"] = priority
+                result["contact_candidates"].append(enriched)
+
             if (
                 page["has_accessibility_signal"]
                 or page["has_request_signal"]
                 or page["has_contact_signal"]
             ):
                 result["related_sources"].append(page)
+
+    # Deduplicate contact candidates and put event-specific evidence first.
+    deduped_contacts = []
+    seen_contacts = set()
+    for candidate in sorted(
+        result["contact_candidates"],
+        key=lambda item: (item.get("priority", 9), item.get("type", ""), item.get("value", ""))
+    ):
+        key = (candidate.get("type"), str(candidate.get("value", "")).casefold())
+        if key in seen_contacts:
+            continue
+        seen_contacts.add(key)
+        deduped_contacts.append(candidate)
+    result["contact_candidates"] = deduped_contacts[:20]
 
     result[
         "status"
