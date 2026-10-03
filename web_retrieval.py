@@ -63,6 +63,12 @@ MAX_SEARCH_PAGES = 4
 SEARCH_RESULT_LIMIT = 10
 MAX_DISCOVERED_LINKS = 300
 
+# Focused fallback discovery is only used for evidence categories that are
+# still missing after the exact page + linked-page pass. Keeping the limits
+# small prevents a broad crawl while making homepage-started research robust.
+MAX_FOCUSED_SEARCH_PAGES_PER_KIND = 3
+MAX_TOTAL_SEARCH_SCRAPES = 7
+
 
 # ---------------------------------------------------------
 # Accessibility vocabulary
@@ -1001,6 +1007,136 @@ def search_official_domain(
     ]
 
 
+FOCUSED_SEARCH_QUERIES = {
+    "accessibility": (
+        'site:{domain} accessibility wheelchair "accessible parking" '
+        'ramps "step free" disability accommodations'
+    ),
+    "timing": (
+        'site:{domain} "opening hours" "visiting hours" "event dates" '
+        '"show timings" "visitor hours"'
+    ),
+    "contact": (
+        'site:{domain} contact "customer service" "visitor enquiries" '
+        '"general enquiries" whatsapp email'
+    ),
+}
+
+
+def _search_result_score(item: Any, kind: str, official_domain: str) -> int:
+    """Rank a search hit for one missing evidence category.
+
+    Search-engine order is useful but not sufficient: a broad event site may
+    rank exhibitor or media pages above visitor information. This score only
+    decides which official pages to *inspect*; it never decides accessibility.
+    """
+    url = document_url(item)
+    if not url or not same_domain(url, official_domain):
+        return -1000
+
+    lowered = url.lower()
+    if any(hint in lowered for hint in NEGATIVE_PATH_HINTS):
+        return -1000
+
+    title = document_title(item)
+    description = document_description(item)
+    haystack = normalize_text(f"{title} {description} {url}")
+
+    score = max(score_link(url, official_domain), 0)
+
+    if kind == "accessibility":
+        if any(x in haystack for x in (
+            "accessibility", "accessible", "wheelchair", "disability",
+            "accommodation", "step free", "step-free", "ramp", "elevator",
+            "lift", "accessible parking", "disabled parking"
+        )):
+            score += 24
+        if any(x in lowered for x in (
+            "accessib", "accommodation", "facilities", "sustainab",
+            "venue", "visit", "faq"
+        )):
+            score += 8
+
+    elif kind == "timing":
+        if any(x in haystack for x in (
+            "opening hours", "visiting hours", "visitor hours", "show timings",
+            "event timings", "event dates", "date and time", "dates and times"
+        )):
+            score += 24
+        if any(x in lowered for x in (
+            "why-visit", "visitor", "show-info", "event-info", "planning",
+            "opening-hours", "schedule", "agenda", "faq", "contact"
+        )):
+            score += 8
+
+    elif kind == "contact":
+        if any(x in haystack for x in (
+            "contact", "customer service", "visitor enquiries", "visitor inquiries",
+            "general enquiries", "general inquiries", "attendee", "whatsapp"
+        )):
+            score += 24
+        if any(x in lowered for x in (
+            "contact", "enquir", "inquir", "support", "help", "visitor"
+        )):
+            score += 8
+        if any(x in haystack for x in (
+            "media", "press", "sponsor", "speaker", "careers", "recruitment"
+        )):
+            score -= 25
+
+    return score
+
+
+def search_official_domain_focused(
+    official_domain: str,
+    missing_kinds: list[str],
+) -> list[dict]:
+    """Run small category-specific official-domain searches for missing evidence.
+
+    This is intentionally generalized: the queries describe evidence roles,
+    never a specific event, organization, email, phone number, or URL path.
+    """
+    combined: dict[str, dict] = {}
+
+    for kind in missing_kinds:
+        template = FOCUSED_SEARCH_QUERIES.get(kind)
+        if not template:
+            continue
+
+        query = template.format(domain=official_domain)
+        result = firecrawl.search(query, limit=SEARCH_RESULT_LIMIT)
+        web_results = safe_attribute(result, "web", default=[]) or []
+
+        ranked = []
+        for item in web_results:
+            url = document_url(item)
+            score = _search_result_score(item, kind, official_domain)
+            if not url or score <= 0:
+                continue
+            ranked.append({
+                "url": url,
+                "title": document_title(item),
+                "description": document_description(item),
+                "score": score,
+                "focus_kind": kind,
+            })
+
+        ranked.sort(key=lambda item: item["score"], reverse=True)
+
+        for candidate in ranked[:MAX_FOCUSED_SEARCH_PAGES_PER_KIND]:
+            key = candidate["url"].rstrip("/")
+            previous = combined.get(key)
+            if previous is None or candidate["score"] > previous["score"]:
+                combined[key] = candidate
+
+    # Highest-value focused pages first, with a global cap.
+    return sorted(
+        combined.values(),
+        key=lambda item: item["score"],
+        reverse=True
+    )[:MAX_TOTAL_SEARCH_SCRAPES]
+
+
 # ---------------------------------------------------------
 # Main retrieval pipeline
 # ---------------------------------------------------------
@@ -1259,96 +1395,100 @@ def research_event(
     )
 
     # -----------------------------------------------------
-    # 4. ONE search fallback
+    # 4. Bounded official-domain fallback discovery
     # -----------------------------------------------------
 
     if needs_search:
+        missing_kinds = []
+        if not specific_evidence_found:
+            missing_kinds.append("accessibility")
+        if not timing_found:
+            missing_kinds.append("timing")
+        if not request_path_found:
+            missing_kinds.append("contact")
 
+        search_candidates: list[dict] = []
+
+        # Keep the broad search as a cheap first pass because it works well on
+        # many event sites.
         try:
-
-            search_results = (
-                search_official_domain(
-                    event_name=
-                        event_name,
-
-                    official_domain=
-                        official_domain
-                )
+            broad = search_official_domain(
+                event_name=event_name,
+                official_domain=official_domain
             )
-
-            result[
-                "retrieval_methods"
-            ].append(
+            search_candidates.extend(broad)
+            result["retrieval_methods"].append(
                 "firecrawl_official_domain_search"
             )
-
         except Exception as error:
+            result["errors"].append({
+                "stage": "official_domain_search",
+                "error": str(error),
+            })
 
-            result[
-                "errors"
-            ].append(
-                {
-                    "stage":
-                        "official_domain_search",
-
-                    "error":
-                        str(error),
-                }
+        # If a category is still missing, add small role-specific searches.
+        # These make starting from a generic homepage robust without hardcoding
+        # event-specific pages such as /why-visit or /contact.
+        try:
+            focused = search_official_domain_focused(
+                official_domain=official_domain,
+                missing_kinds=missing_kinds,
             )
-
-            search_results = []
+            search_candidates.extend(focused)
+            if focused:
+                result["retrieval_methods"].append(
+                    "firecrawl_focused_official_search"
+                )
+        except Exception as error:
+            result["errors"].append({
+                "stage": "focused_official_search",
+                "error": str(error),
+            })
 
         existing_urls = {
-            primary[
-                "url"
-            ].rstrip("/")
+            primary["url"].rstrip("/")
         }
-
         existing_urls.update(
-            source[
-                "url"
-            ].rstrip("/")
-            for source in result[
-                "related_sources"
-            ]
+            source["url"].rstrip("/")
+            for source in result["related_sources"]
         )
 
-        for candidate in search_results:
-
-            url = candidate[
-                "url"
-            ]
-
-            if (
-                url.rstrip("/")
-                in existing_urls
-            ):
+        # Deduplicate candidate URLs while preserving the strongest score.
+        unique_candidates: dict[str, dict] = {}
+        for candidate in search_candidates:
+            url = candidate.get("url")
+            if not url:
                 continue
+            key = url.rstrip("/")
+            if key in existing_urls:
+                continue
+            previous = unique_candidates.get(key)
+            if (
+                previous is None
+                or candidate.get("score", 0) > previous.get("score", 0)
+            ):
+                unique_candidates[key] = candidate
+
+        ordered_candidates = sorted(
+            unique_candidates.values(),
+            key=lambda item: item.get("score", 0),
+            reverse=True
+        )[:MAX_TOTAL_SEARCH_SCRAPES]
+
+        for candidate in ordered_candidates:
+            url = candidate["url"]
 
             try:
-
                 page = scrape_page(
                     url,
                     MAX_RELATED_CHARS
                 )
-
             except Exception as error:
-
-                result[
-                    "errors"
-                ].append(
-                    {
-                        "stage":
-                            "search_result_scrape",
-
-                        "url":
-                            url,
-
-                        "error":
-                            str(error),
-                    }
-                )
-
+                result["errors"].append({
+                    "stage": "search_result_scrape",
+                    "url": url,
+                    "error": str(error),
+                })
                 continue
 
             if page["url"] not in result["pages_checked"]:
@@ -1357,6 +1497,8 @@ def research_event(
             annotate_page_year_context(page, event_year_hint)
             role = page_role(page["url"], event_url)
             page["source_role"] = role
+            page["discovery_focus"] = candidate.get("focus_kind")
+
             priority = {
                 "accessibility_or_accommodation_page": 2,
                 "contact_page": 3,
@@ -1365,6 +1507,7 @@ def research_event(
                 "venue_or_visit_page": 3,
                 "related_official_page": 4,
             }.get(role, 4)
+
             for contact in page.get("contact_candidates", []):
                 enriched = dict(contact)
                 enriched["source_role"] = role
@@ -1482,7 +1625,10 @@ def research_event(
         "Do not call research_event again for links discovered in this result. "
         "Use primary_source, related_sources, event_fact_snippets, and pages_checked. "
         "Before saying a time or contact is not stated, inspect event_fact_snippets from every "
-        "retrieved page and preferred_contact_candidates. For generic contact channels, a current "
+        "retrieved page and preferred_contact_candidates. If a retrieved event-information page "
+        "contains explicit visitor/opening hours, use those hours. If a current official contact "
+        "page provides a visitor/customer-service channel, prefer it over a stale or ambiguous "
+        "widget/contact. For generic contact channels, a current "
         "dedicated official contact/customer-service page can outrank a homepage widget when its "
         "context is clearer. Prefer exact-event/current or undated official evidence "
         "over older_year_only evidence. Older-year-only evidence may describe a prior edition "
