@@ -253,6 +253,52 @@ def _contact_from_recommendation(value: str | None) -> str | None:
         return phone_match.group(0).strip().rstrip('.,);]')
     return None
 
+
+def _explicit_action_section(report: str) -> dict[str, str | None]:
+    """Recover action fields from an explicit report section when formatter misses them."""
+    result = {"official_contact": None, "recommendation": None}
+    lines = report.splitlines()
+
+    # Contact: prefer a line near an explicit contact/action heading rather than
+    # scanning arbitrary event prose for phone numbers.
+    for idx, line in enumerate(lines):
+        low = normalized(line).lower()
+        if any(label in low for label in (
+            "official contact", "contact / form", "contact/form",
+            "official contact / form", "request action"
+        )):
+            block = "\n".join(lines[idx: min(len(lines), idx + 8)])
+            email_match = re.search(r'[^\s<>]+@[^\s<>]+\.[^\s<>]+', block)
+            if email_match:
+                result["official_contact"] = email_match.group(0).rstrip('.,);]')
+                break
+            phone_match = re.search(r'\+[0-9][0-9() .-]{7,}[0-9]', block)
+            if phone_match:
+                result["official_contact"] = phone_match.group(0).strip().rstrip('.,);]')
+                break
+
+    # Recommendation: copy only text explicitly placed under a recommendation
+    # label. Never synthesize a next step here.
+    for idx, line in enumerate(lines):
+        low = normalized(line).lower()
+        if "recommended action" not in low and "recommendation" not in low:
+            continue
+        values = []
+        for candidate in lines[idx + 1: min(len(lines), idx + 7)]:
+            clean = normalized(candidate)
+            if not clean:
+                continue
+            if re.match(r'^(event details|accessibility check|request action|email draft)\b', clean, flags=re.I):
+                break
+            values.append(clean)
+            if len(" ".join(values)) >= 320:
+                break
+        if values:
+            result["recommendation"] = " ".join(values)[:500]
+            break
+
+    return result
+
 def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: str | None, previous: dict | None = None) -> dict:
     previous = previous or {}
     event = dict(previous.get('event') or {})
@@ -338,6 +384,12 @@ def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: st
             action['recommendation'] = normalized(quote)
     if _is_meta_recommendation(action.get('recommendation')):
         action['recommendation'] = None
+
+    explicit_action = _explicit_action_section(report)
+    if not action.get('official_contact') and explicit_action.get('official_contact'):
+        action['official_contact'] = explicit_action['official_contact']
+    if not action.get('recommendation') and explicit_action.get('recommendation'):
+        action['recommendation'] = explicit_action['recommendation']
 
     all_not_applicable = bool(rows) and all(
         row.get('status') == 'NOT APPLICABLE' for row in rows

@@ -19,7 +19,7 @@ import re
 import sys
 from copy import deepcopy
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import tldextract
 from dotenv import load_dotenv
@@ -61,6 +61,7 @@ MAX_RELATED_CHARS = 10000
 MAX_LINKED_PAGES = 5
 MAX_SEARCH_PAGES = 4
 SEARCH_RESULT_LIMIT = 10
+MAX_DISCOVERED_LINKS = 300
 
 
 # ---------------------------------------------------------
@@ -680,10 +681,28 @@ def scrape_page(
         or []
     )
 
+    page_url = document_url(document) or url
+    normalized_links = []
+    seen_links = set()
+    for link in links:
+        if not isinstance(link, str) or not link.strip():
+            continue
+        absolute = urljoin(page_url, link.strip())
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        absolute = absolute.split("#", 1)[0]
+        key = absolute.rstrip("/")
+        if key in seen_links:
+            continue
+        seen_links.add(key)
+        normalized_links.append(absolute)
+        if len(normalized_links) >= MAX_DISCOVERED_LINKS:
+            break
+
     return {
         "url":
-            document_url(document)
-            or url,
+            page_url,
 
         "title":
             document_title(document),
@@ -692,7 +711,7 @@ def scrape_page(
             markdown[:char_limit],
 
         "links":
-            list(links)[:100],
+            normalized_links,
 
         "has_accessibility_signal":
             has_accessibility_signal(
@@ -722,8 +741,8 @@ def scrape_page(
         "contact_candidates":
             extract_contact_candidates(
                 markdown,
-                list(links)[:100],
-                document_url(document) or url
+                normalized_links,
+                page_url
             ),
     }
 
@@ -770,11 +789,19 @@ def select_primary_links(
     primary_url: str,
     official_domain: str
 ) -> list[str]:
+    """Select a small but functionally diverse set of official pages.
 
+    Event homepages often contain hundreds of links. Pure score sorting can pick
+    several pages from one category and miss the one page that contains opening
+    hours or the current contact channel. We therefore reserve category slots,
+    then fill remaining capacity by score. This is URL-pattern based and does not
+    depend on any specific event or organization.
+    """
     candidates = []
     seen = {primary_url.rstrip("/")}
 
-    for url in links:
+    for raw_url in links:
+        url = urljoin(primary_url, raw_url)
         normalized_url = url.rstrip("/")
         if normalized_url in seen:
             continue
@@ -786,41 +813,43 @@ def select_primary_links(
         candidates.append((score, url))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
-    selected = [url for _, url in candidates[:MAX_LINKED_PAGES]]
 
-    # Preserve source diversity. Contact pages can otherwise lose to several
-    # high-scoring venue/accessibility pages even though the request path matters.
-    contact_candidates = [
-        url for _, url in candidates
-        if any(token in url.lower() for token in ('contact', 'enquir', 'inquir', 'support', 'help'))
-    ]
-    if contact_candidates and not any(url in selected for url in contact_candidates):
-        if len(selected) >= MAX_LINKED_PAGES:
-            selected[-1] = contact_candidates[0]
-        else:
-            selected.append(contact_candidates[0])
+    category_tokens = {
+        "accessibility": ("accessib", "accommodation", "special-assistance", "facilities"),
+        "timing": (
+            "show-info", "show-information", "event-info", "event-information",
+            "opening-hours", "show-dates", "show-times", "visitor-information",
+            "visitor-info", "planning-preparation", "why-visit", "schedule",
+            "agenda", "when-where", "dates-times", "dates-and-times", "timings"
+        ),
+        "contact": ("contact", "enquir", "inquir", "customer-service", "support", "help"),
+        "venue": ("venue", "travel", "getting-here", "location", "visit"),
+        "faq": ("faq", "frequently-asked"),
+    }
 
-    # Preserve one schedule/show-information style page when available so event
-    # hours are not crowded out by several accessibility/venue links.
-    timing_candidates = [
-        url for _, url in candidates
-        if any(token in url.lower() for token in (
-            'show-info', 'show-information', 'event-info', 'event-information',
-            'opening-hours', 'show-dates', 'show-times', 'visitor-information',
-            'visitor-info', 'planning-preparation', 'why-visit', 'schedule',
-            'agenda', 'when-where'
-        ))
-    ]
-    if timing_candidates and not any(url in selected for url in timing_candidates):
+    selected: list[str] = []
+    selected_keys: set[str] = set()
+
+    def add(url: str) -> None:
+        key = url.rstrip("/")
+        if key in selected_keys or len(selected) >= MAX_LINKED_PAGES:
+            return
+        selected.append(url)
+        selected_keys.add(key)
+
+    # Reserve one slot for each useful page role when that role exists.
+    for tokens in category_tokens.values():
+        for _, url in candidates:
+            low = url.lower()
+            if any(token in low for token in tokens):
+                add(url)
+                break
+
+    # Fill remaining slots by overall relevance.
+    for _, url in candidates:
+        add(url)
         if len(selected) >= MAX_LINKED_PAGES:
-            # Replace the lowest-ranked selected link only if it is not the
-            # dedicated contact page we intentionally preserved above.
-            replace_index = len(selected) - 1
-            if selected[replace_index] in contact_candidates and len(selected) > 1:
-                replace_index -= 1
-            selected[replace_index] = timing_candidates[0]
-        else:
-            selected.append(timing_candidates[0])
+            break
 
     return selected
 
@@ -846,7 +875,8 @@ def search_official_domain(
     query = (
         f'site:{official_domain} '
         f'accessibility accommodations contact venue wheelchair '
-        f'"step free" ramps elevators captions'
+        f'"step free" ramps elevators captions '
+        f'"opening hours" timings "visitor information" schedule'
     )
 
     result = firecrawl.search(
@@ -934,6 +964,12 @@ def search_official_domain(
 
         if "contact" in text or "enquir" in text or "inquir" in text:
             score += 3
+
+        if any(term in text for term in (
+            "opening hours", "show hours", "event hours", "show timings",
+            "event timings", "visitor information", "schedule", "agenda"
+        )):
+            score += 6
 
         # Event-name overlap is a useful boost, but never a hard requirement.
         event_tokens = [
@@ -1207,10 +1243,20 @@ def research_event(
         )
     )
 
-    # A generic accessibility sentence is not enough to stop discovery.
-    # Search once when either concrete accessibility evidence OR a usable
-    # official request/contact path is still missing.
-    needs_search = not specific_evidence_found or not request_path_found
+    timing_found = bool(primary.get("event_fact_snippets", {}).get("time")) or any(
+        source.get("event_fact_snippets", {}).get("time")
+        for source in result["related_sources"]
+    )
+
+    # A generic accessibility sentence is not enough to stop discovery. Search
+    # once when concrete accessibility evidence, a usable request/contact path,
+    # OR basic event timing is still missing. This makes homepage research more
+    # complete without crawling the whole site.
+    needs_search = (
+        not specific_evidence_found
+        or not request_path_found
+        or not timing_found
+    )
 
     # -----------------------------------------------------
     # 4. ONE search fallback
@@ -1314,6 +1360,7 @@ def research_event(
             priority = {
                 "accessibility_or_accommodation_page": 2,
                 "contact_page": 3,
+                "event_information_page": 3,
                 "faq_page": 3,
                 "venue_or_visit_page": 3,
                 "related_official_page": 4,
