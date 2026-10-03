@@ -79,31 +79,78 @@ def research_event(event_url: str):
 
 
 @tool
-def check_event_timing(event_date: str, preferred_notice_days: int):
+def check_event_timing(
+    event_date: str,
+    preferred_notice_days: int | None = None,
+    event_end_date: str | None = None
+):
     """
-    Check the timing of an event and whether the preferred accommodation
-    notice window is still open.
+    Check an event's lifecycle and, when provided, its accommodation notice window.
 
     Args:
-        event_date: Event date in YYYY-MM-DD format.
-        preferred_notice_days: Number of days of advance notice requested.
+        event_date: Event start date in YYYY-MM-DD format.
+        preferred_notice_days: Optional number of days of advance notice stated by
+            the organizer. Pass None when no notice period is stated.
+        event_end_date: Optional event end date in YYYY-MM-DD format for multi-day
+            events.
     """
 
-    event = datetime.strptime(event_date, "%Y-%m-%d").date()
-    today = date.today()
-
-    days_until_event = (event - today).days
-    notice_deadline = event.fromordinal(
-        event.toordinal() - preferred_notice_days
+    start = datetime.strptime(event_date, "%Y-%m-%d").date()
+    end = (
+        datetime.strptime(event_end_date, "%Y-%m-%d").date()
+        if event_end_date
+        else start
     )
 
-    return {
-        "event_date": event.isoformat(),
-        "day_of_week": event.strftime("%A"),
-        "days_until_event": days_until_event,
-        "preferred_notice_deadline": notice_deadline.isoformat(),
-        "preferred_window_passed": today > notice_deadline
+    if end < start:
+        raise ValueError("event_end_date cannot be before event_date.")
+
+    today = date.today()
+
+    if today > end:
+        event_status = "PAST"
+    elif start <= today <= end:
+        event_status = "ONGOING" if end > start else "TODAY"
+    else:
+        event_status = "UPCOMING"
+
+    result = {
+        "today": today.isoformat(),
+        "event_date": start.isoformat(),
+        "event_end_date": end.isoformat() if event_end_date else None,
+        "day_of_week": start.strftime("%A"),
+        "days_until_event": (start - today).days,
+        "days_until_end": (end - today).days,
+        "event_status": event_status,
+        "event_has_passed": event_status == "PAST",
+        "preferred_notice_days": preferred_notice_days,
+        "preferred_notice_deadline": None,
+        "preferred_window_passed": None,
+        "notice_window_status": None,
     }
+
+    if preferred_notice_days is not None:
+        if preferred_notice_days < 0:
+            raise ValueError("preferred_notice_days cannot be negative.")
+
+        notice_deadline = start.fromordinal(
+            start.toordinal() - preferred_notice_days
+        )
+
+        if today > notice_deadline:
+            notice_status = "PASSED"
+        elif today == notice_deadline:
+            notice_status = "DUE_TODAY"
+        else:
+            notice_status = "OPEN"
+
+        result.update({
+            "preferred_notice_deadline": notice_deadline.isoformat(),
+            "preferred_window_passed": today > notice_deadline,
+            "notice_window_status": notice_status,
+        })
+
+    return result
 
 @tool
 def check_event_accessibility(event_url: str):
@@ -756,22 +803,40 @@ Never claim an accommodation is confirmed unless there is explicit evidence.
 
 DATE AND TIMING RULES
 
-Never calculate dates, weekdays, notice periods, deadlines, or date differences
-yourself.
+Never calculate dates, weekdays, notice periods, deadlines, event lifecycle,
+or date differences yourself.
 
-If the event provides an advance-notice requirement or recommendation,
-use check_event_timing.
+Whenever an event date is available, ALWAYS call check_event_timing exactly once
+for that event analysis, even when no accommodation notice period is stated.
 
 When calling check_event_timing:
-- normalize the observed event date to YYYY-MM-DD
-- pass the number of preferred or required notice days stated by the organizer
+- normalize the observed event START date to YYYY-MM-DD
+- for a multi-day event, also pass event_end_date in YYYY-MM-DD
+- if the organizer states an advance-notice period, pass its number of days
+- if no notice period is stated, omit preferred_notice_days or pass None
 
-Use the result returned by check_event_timing for:
-- event date
-- day of week
-- days until the event
-- preferred notice date
-- whether the notice window has passed
+The values returned by check_event_timing are authoritative. In particular, use:
+- event_status exactly as returned: UPCOMING, TODAY, ONGOING, or PAST
+- notice_window_status exactly as returned: OPEN, DUE_TODAY, PASSED, or None
+- preferred_notice_deadline exactly as returned
+- event_has_passed exactly as returned
+
+Never override, reinterpret, or recalculate these fields in prose.
+
+If event_status is PAST:
+- clearly state that the event has already occurred
+- do NOT recommend sending an accommodation request for that event
+- do NOT draft an accommodation email for that event
+- do NOT recommend filling an accommodation form for that event
+- the recommended action must state that no current accommodation request should
+  be initiated for the past event
+- only mention recordings, future events, or general follow-up if an official
+  source actually provides a relevant channel; do not invent one
+
+If notice_window_status is OPEN, explicitly say the notice window is still open.
+If it is DUE_TODAY, explicitly say the notice date is today.
+If it is PASSED, state that the stated notice period has passed.
+If it is None, do not invent a notice period.
 
 If the official source says words such as:
 - "preferably"
@@ -787,11 +852,52 @@ relabel it as merely preferred unless the source itself says so.
 Do NOT call it a hard deadline unless the official source explicitly states
 that requests after that date are not accepted.
 
-If preferred_window_passed is true, state that the request is being made
-after or outside the preferred notice period.
-
 Do not claim that a late request can or cannot be accommodated unless the
 official organizer explicitly states this.
+
+
+SOURCE AND CONTACT PRIORITY
+
+When multiple official sources or contact channels are available, prefer them in
+this order:
+1. event-specific accommodation instructions linked from the exact event page
+2. event-specific accessibility contact or accommodation form
+3. event-specific organizer contact
+4. site-wide accessibility/disability office guidance
+5. general organization or communications contact
+
+Do not describe a general communications or organizer email as an accessibility
+contact unless the source explicitly says it handles accessibility or accommodation
+requests. Label the contact type accurately in the report, for example:
+- Accessibility contact
+- Event organizer contact
+- General organization contact
+
+If two official sources give different accommodation instructions, use the more
+event-specific instruction and mention the broader instruction only as secondary
+context. Do not silently merge conflicting deadlines or contacts.
+
+
+RECOMMENDED ACTION RULES
+
+The Recommended action must always be a concrete next step based on verified
+official channels. Never write vague meta-text such as:
+- "Ask Accessly about the next step"
+- "Let me know how you want to proceed"
+- "I can help if you want"
+
+Use this priority unless event_status is PAST:
+1. If an official event-specific accommodation form exists, recommend using that form.
+2. Otherwise, if an accessibility-specific email/contact exists, recommend contacting it.
+3. Otherwise, if an event-specific organizer contact exists, recommend contacting it.
+4. Otherwise, if only a general organization contact exists, recommend it only as a
+   fallback and label it as general.
+5. If no verified channel exists, say that no verified accommodation request channel
+   was found in the official sources checked.
+
+For a hybrid event, physical accessibility needs remain applicable because an
+in-person attendance option exists. Only classify physical needs as NOT APPLICABLE
+when the event is fully virtual with no physical attendance option.
 
 
 EVENT DATE CONSISTENCY
@@ -833,6 +939,13 @@ ASL interpretation, or another service.
 
 
 EMAIL DRAFTING
+
+Do not draft an accommodation email when check_event_timing returned
+event_status="PAST".
+
+If an official event-specific accommodation form exists, recommend that form as
+the primary next step. Draft an email instead only when no usable official form
+exists, or when the user explicitly asks to use email.
 
 If one or more required accommodations are not confirmed and an official
 organizer or accessibility email is available:
@@ -1005,7 +1118,10 @@ At the end of an event analysis, clearly report:
 4. Which accommodations remain unconfirmed or unknown
 5. The official accommodation request method available
 6. Any relevant preferred or required notice period
-7. The appropriate next action
+7. The appropriate next action, written as a concrete action rather than a
+   meta-instruction to ask Accessly what to do next
+8. If check_event_timing was used, the event lifecycle (upcoming/today/ongoing/past)
+   and the exact notice-window state returned by the tool
 
 If an email draft is needed, present it and wait for explicit user approval
 before taking any sending action.

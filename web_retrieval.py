@@ -58,9 +58,9 @@ _RESEARCH_CACHE: dict[str, dict] = {}
 MAX_PRIMARY_CHARS = 18000
 MAX_RELATED_CHARS = 8000
 
-MAX_LINKED_PAGES = 2
-MAX_SEARCH_PAGES = 2
-SEARCH_RESULT_LIMIT = 5
+MAX_LINKED_PAGES = 4
+MAX_SEARCH_PAGES = 3
+SEARCH_RESULT_LIMIT = 8
 
 
 # ---------------------------------------------------------
@@ -91,6 +91,22 @@ ACCESSIBILITY_TERMS = [
     "disabled visitors",
     "visitors with disabilities",
     "mobility assistance",
+    "step-free",
+    "step free",
+    "barrier-free",
+    "barrier free",
+    "ramp",
+    "ramps",
+    "elevator",
+    "elevators",
+    "lift",
+    "lifts",
+    "wheelchair available",
+    "wheelchairs available",
+    "disabled parking",
+    "accessible facilities",
+    "accessible venue",
+    "people of determination",
 ]
 
 REQUEST_TERMS = [
@@ -117,7 +133,12 @@ POSITIVE_PATH_HINTS = {
     "attendee": 5,
     "registration": 4,
     "register": 4,
-    "travel": 4,
+    "travel": 5,
+    "travel-info": 7,
+    "getting-here": 7,
+    "venue-info": 7,
+    "facilities": 7,
+    "sustainability": 3,
     "help": 4,
     "support": 4,
 }
@@ -314,6 +335,51 @@ def has_request_signal(
     )
 
 
+SPECIFIC_ACCESSIBILITY_TERMS = [
+    "wheelchair",
+    "step-free",
+    "step free",
+    "barrier-free",
+    "barrier free",
+    "accessible entrance",
+    "accessible parking",
+    "disabled parking",
+    "accessible seating",
+    "accessible restroom",
+    "accessible toilet",
+    "ramp",
+    "elevator",
+    "lift",
+    "caption",
+    "cart",
+    "sign language",
+    "asl",
+    "hearing loop",
+    "assistive listening",
+    "mobility assistance",
+]
+
+
+def has_specific_accessibility_signal(text: str) -> bool:
+    normalized = normalize_text(text)
+    return any(term in normalized for term in SPECIFIC_ACCESSIBILITY_TERMS)
+
+
+def has_contact_signal(text: str) -> bool:
+    normalized = normalize_text(text)
+    if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text or "", flags=re.I):
+        return True
+    return any(phrase in normalized for phrase in [
+        "contact us",
+        "contact the organiser",
+        "contact the organizer",
+        "general enquiries",
+        "general inquiries",
+        "customer service",
+        "whatsapp",
+    ])
+
+
 def extract_event_name(
     markdown: str,
     title: str,
@@ -421,8 +487,18 @@ def scrape_page(
                 markdown
             ),
 
+        "has_specific_accessibility_signal":
+            has_specific_accessibility_signal(
+                markdown
+            ),
+
         "has_request_signal":
             has_request_signal(
+                markdown
+            ),
+
+        "has_contact_signal":
+            has_contact_signal(
                 markdown
             ),
     }
@@ -529,12 +605,12 @@ def search_official_domain(
         .strip()
     )[:120]
 
-    # ONE search instead of multiple searches.
+    # ONE bounded official-domain search. Do not require the event name because
+    # venue/accessibility/contact pages often omit it entirely.
     query = (
         f'site:{official_domain} '
-        f'"{safe_event_name}" '
-        f'accessibility wheelchair accommodations '
-        f'"special assistance"'
+        f'accessibility wheelchair "step free" ramps elevators '
+        f'accommodations disability venue contact'
     )
 
     result = firecrawl.search(
@@ -607,6 +683,29 @@ def search_official_domain(
 
         if "special assistance" in text:
             score += 6
+
+        if "step free" in text or "step-free" in text:
+            score += 7
+
+        if "ramp" in text or "elevator" in text or "lift" in text:
+            score += 6
+
+        if "disabled parking" in text or "accessible parking" in text:
+            score += 6
+
+        if "caption" in text or "cart" in text:
+            score += 6
+
+        if "contact" in text or "enquir" in text or "inquir" in text:
+            score += 3
+
+        # Event-name overlap is a useful boost, but never a hard requirement.
+        event_tokens = [
+            token for token in re.findall(r"[a-z0-9]+", safe_event_name.lower())
+            if len(token) >= 4
+        ]
+        if event_tokens and any(token in text for token in event_tokens[:8]):
+            score += 3
 
         if score <= 0:
             continue
@@ -796,20 +895,13 @@ def research_event(
         if page["url"] not in result["pages_checked"]:
             result["pages_checked"].append(page["url"])
 
-        # Only keep actual useful evidence pages.
+        # Keep accessibility/request evidence plus official contact pages.
         if (
-            page[
-                "has_accessibility_signal"
-            ]
-            or page[
-                "has_request_signal"
-            ]
+            page["has_accessibility_signal"]
+            or page["has_request_signal"]
+            or page["has_contact_signal"]
         ):
-            result[
-                "related_sources"
-            ].append(
-                page
-            )
+            result["related_sources"].append(page)
 
     if selected_links:
 
@@ -823,25 +915,33 @@ def research_event(
     # 3. Decide whether we need Search fallback
     # -----------------------------------------------------
 
-    evidence_found = (
-        primary[
-            "has_accessibility_signal"
-        ]
-        or primary[
-            "has_request_signal"
-        ]
-        or bool(
-            result[
-                "related_sources"
-            ]
+    specific_evidence_found = (
+        primary["has_specific_accessibility_signal"]
+        or any(
+            source.get("has_specific_accessibility_signal")
+            for source in result["related_sources"]
         )
     )
+
+    request_path_found = (
+        primary["has_request_signal"]
+        or primary["has_contact_signal"]
+        or any(
+            source.get("has_request_signal") or source.get("has_contact_signal")
+            for source in result["related_sources"]
+        )
+    )
+
+    # A generic accessibility sentence is not enough to stop discovery.
+    # Search once when either concrete accessibility evidence OR a usable
+    # official request/contact path is still missing.
+    needs_search = not specific_evidence_found or not request_path_found
 
     # -----------------------------------------------------
     # 4. ONE search fallback
     # -----------------------------------------------------
 
-    if not evidence_found:
+    if needs_search:
 
         try:
 
@@ -934,18 +1034,11 @@ def research_event(
                 result["pages_checked"].append(page["url"])
 
             if (
-                page[
-                    "has_accessibility_signal"
-                ]
-                or page[
-                    "has_request_signal"
-                ]
+                page["has_accessibility_signal"]
+                or page["has_request_signal"]
+                or page["has_contact_signal"]
             ):
-                result[
-                    "related_sources"
-                ].append(
-                    page
-                )
+                result["related_sources"].append(page)
 
     result[
         "status"

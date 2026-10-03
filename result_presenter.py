@@ -53,6 +53,8 @@ Accessibility: only include explicitly assessed saved needs, preserving each exa
 Never turn NOT CONFIRMED into CONFIRMED. Evidence is one short plain sentence, supported by a verbatim quote. The quote MUST include the saved need name and its explicit status, not only the explanation. Copy the entire table row when applicable.
 An accommodation request channel is not evidence that a need is confirmed.
 Action: extract the official email/form, official accommodation notice period (not a registration deadline, calculated suggested date, or user preferred notice window), and the recommended next action.
+The recommended action must be a concrete action already stated in the report. Do not treat meta-dialogue such as "Ask Accessly about the next step", "let me know", "would you like me to", or "I can help" as a recommended action. If the report contains only meta-dialogue and no concrete action, return recommendation=null.
+Preserve contact type when the report distinguishes an accessibility contact, event organizer contact, or general organization contact.
 Draft: only extract an actual complete proposed email with recipient, subject, and body. Copy its exact text without rewriting.
 The draft can be in a code block or after a Subject heading, with no Body label. Exclude surrounding approval questions.
 Do not create a draft from a sent-email summary. If no complete draft exists, return null.
@@ -79,6 +81,20 @@ def supported(fact: Fact | None, report: str) -> str | None:
         if value and value.upper() not in {'UNKNOWN', 'NOT PROVIDED', 'NOT SPECIFIED', 'N/A'}:
             return value
     return None
+
+def _is_meta_recommendation(value: str | None) -> bool:
+    if not value:
+        return False
+    lowered = normalized(value).lower()
+    phrases = (
+        'ask accessly',
+        'let me know',
+        'would you like me to',
+        'i can help',
+        'ask me about the next step',
+        'tell me how you want to proceed',
+    )
+    return any(phrase in lowered for phrase in phrases)
 
 def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: str | None, previous: dict | None = None) -> dict:
     previous = previous or {}
@@ -114,6 +130,8 @@ def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: st
         quote = extracted.recommended_action.recommendation.source_quote
         if normalized(quote) and normalized(quote) in normalized(report):
             action['recommendation'] = normalized(quote)
+    if _is_meta_recommendation(action.get('recommendation')):
+        action['recommendation'] = None
     draft = None
     if extracted.draft:
         candidate = extracted.draft
