@@ -1,10 +1,14 @@
 FROM python:3.11-slim-bookworm
+
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright STRANDS_BROWSER_HEADLESS=true \
     ACCESSLY_PUBLIC_MODE=1 ACCESSLY_DATA_DIR=/var/data/accessly \
     PORT=8000 AWS_REGION=eu-north-1 PYTHON_DOTENV_DISABLED=1
+
 WORKDIR /app
+
 COPY requirements-production.txt ./
+
 RUN pip install --no-cache-dir -r requirements-production.txt \
     && python -m pip check \
     && python -c "from strands import Agent; from strands_tools.browser import LocalChromiumBrowser; import nest_asyncio; import playwright.sync_api" \
@@ -12,8 +16,19 @@ RUN pip install --no-cache-dir -r requirements-production.txt \
     && useradd --create-home --uid 10001 accessly \
     && mkdir -p /var/data/accessly \
     && chown -R accessly:accessly /app /var/data/accessly
-COPY --chown=accessly:accessly api.py main.py result_presenter.py deployment_runtime.py ./
+
+COPY --chown=accessly:accessly \
+    api.py \
+    main.py \
+    web_retrieval.py \
+    result_presenter.py \
+    deployment_runtime.py \
+    ./
+
 COPY --chown=accessly:accessly container_smoke.py ./
+
 USER accessly
+
 EXPOSE 8000
+
 CMD ["sh", "-c", "exec python -m uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
