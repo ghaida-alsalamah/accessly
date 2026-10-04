@@ -1,0 +1,11 @@
+{
+  "title": "AA",
+  "description": "Effortlessly submit event links or revisit past searches with a sleek, accessibility-first interface designed for seamless user experience.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

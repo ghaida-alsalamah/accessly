@@ -49,10 +49,12 @@ Do not research, infer, guess, calculate, send, or change the underlying agent's
 Event facts: copy verbatim values from the report. Split date and time when both are stated; keep timezone with time.
 Map a clearly stated virtual/online attendance location to location and format, without inventing a venue.
 Every fact needs a verbatim source_quote containing its value. Use null when unknown or not found.
-Accessibility: only include explicitly assessed saved needs, preserving each exact saved name and explicit classification.
-Never turn NOT CONFIRMED into CONFIRMED. Evidence is one short plain sentence, supported by a verbatim quote. The quote MUST include the saved need name and its explicit status, not only the explanation. Copy the entire table row when applicable.
+Accessibility: only include explicitly assessed saved needs. Match saved need names case-insensitively, but output the exact saved spelling supplied in saved_needs.
+Never turn NOT CONFIRMED into CONFIRMED. Evidence is one short plain sentence, supported by a verbatim quote. Prefer a per-need table row, heading block, or line that explicitly contains the saved need and its status.
 An accommodation request channel is not evidence that a need is confirmed.
-Action: extract the official email/form, official accommodation notice period (not a registration deadline, calculated suggested date, or user preferred notice window), and the recommended next action.
+Action: extract the official email/form, official accommodation notice period (not a registration deadline, calculated suggested date, or user preferred notice window), and the recommended next action. When an official accommodation form exists and the report says Accessly can fill it, preserve that assisted-form wording rather than rewriting it as a manual instruction to the user.
+The recommended action must be a concrete action already stated in the report. Do not treat meta-dialogue such as "Ask Accessly about the next step", "let me know", "would you like me to", or "I can help" as a recommended action. If the report contains only meta-dialogue and no concrete action, return recommendation=null.
+Preserve contact type when the report distinguishes an accessibility contact, event organizer contact, or general organization contact.
 Draft: only extract an actual complete proposed email with recipient, subject, and body. Copy its exact text without rewriting.
 The draft can be in a code block or after a Subject heading, with no Body label. Exclude surrounding approval questions.
 Do not create a draft from a sent-email summary. If no complete draft exists, return null.
@@ -73,6 +75,151 @@ def normalized(value: str) -> str:
     value = value.replace('|', ' ').replace('*', '').replace('`', '')
     return ' '.join(value.split())
 
+
+STATUS_VALUES = ('NOT CONFIRMED', 'NOT APPLICABLE', 'CONFIRMED', 'UNKNOWN')
+
+
+def _status_in_text(value: str) -> str | None:
+    upper = normalized(value).upper()
+    # Longer statuses must be checked before CONFIRMED.
+    for status in STATUS_VALUES:
+        if re.search(rf'\b{re.escape(status)}\b', upper):
+            return status
+    return None
+
+
+def _saved_need_lookup(needs: list[str]) -> dict[str, str]:
+    return {normalized(name).casefold(): name for name in needs}
+
+
+def _individual_need_excerpt(report: str, need: str, all_needs: list[str]) -> tuple[str | None, str | None]:
+    """Find an explicit per-need assessment without trusting group summaries."""
+    lines = report.splitlines()
+    target = normalized(need).casefold()
+    all_norm = [normalized(n).casefold() for n in all_needs]
+
+    # 1) Best case: one line/table row contains this need and a status, but not
+    # several different saved needs (which is usually an aggregate summary).
+    for idx, line in enumerate(lines):
+        nline = normalized(line)
+        low = nline.casefold()
+        if not target or target not in low:
+            continue
+        mentioned = sum(1 for n in all_norm if n and n in low)
+        status = _status_in_text(nline)
+        if status and mentioned <= 1:
+            excerpt = line.strip()
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1].strip()
+                if nxt and not _status_in_text(nxt) and len(normalized(nxt)) <= 600:
+                    excerpt = f"{excerpt}\n{nxt}"
+            return status, excerpt
+
+    # 2) Common UI/report layout: need is a heading and the status appears on
+    # one of the next few lines.
+    for idx, line in enumerate(lines):
+        nline = normalized(line).casefold()
+        if not target or target not in nline:
+            continue
+        if sum(1 for n in all_norm if n and n in nline) > 1:
+            continue
+        block = lines[idx: min(len(lines), idx + 7)]
+        for candidate in block:
+            status = _status_in_text(candidate)
+            if status:
+                excerpt = "\n".join(x.strip() for x in block if x.strip())[:1200]
+                return status, excerpt
+
+    # 3) Last resort: a small character window around the exact need mention,
+    # still rejecting windows that contain several saved needs.
+    nreport = normalized(report)
+    low_report = nreport.casefold()
+    start = 0
+    while target:
+        pos = low_report.find(target, start)
+        if pos < 0:
+            break
+        left = max(0, pos - 180)
+        right = min(len(nreport), pos + len(target) + 360)
+        window = nreport[left:right]
+        if sum(1 for n in all_norm if n and n in window.casefold()) <= 1:
+            status = _status_in_text(window)
+            if status:
+                return status, window
+        start = pos + len(target)
+
+    return None, None
+
+
+def _evidence_from_excerpt(excerpt: str | None, need: str, status: str) -> str:
+    if not excerpt:
+        return 'The agent explicitly assessed this saved need.'
+    lines = [normalized(x) for x in excerpt.splitlines() if normalized(x)]
+    # Prefer a sentence/line that is not just the need name or status label.
+    for line in lines:
+        upper = line.upper()
+        if normalized(need).casefold() in line.casefold() and _status_in_text(line):
+            continue
+        if upper in STATUS_VALUES:
+            continue
+        if len(line) >= 20:
+            return line[:600]
+    return f'The agent explicitly classified this need as {status.title()}.'
+
+
+def _message_contradicts_rows(message: str, rows: list[dict]) -> bool:
+    low = normalized(message).lower()
+    statuses = [row.get('status') for row in rows]
+    if not statuses:
+        return False
+    if ('all three' in low or 'all of your' in low or 'all saved' in low) and 'confirmed' in low and 'not confirmed' not in low:
+        return not all(s == 'CONFIRMED' for s in statuses)
+    if ('none of' in low or 'none ' in low) and 'confirmed' in low:
+        return any(s == 'CONFIRMED' for s in statuses)
+    if ('all three' in low or 'all of your' in low or 'all saved' in low) and 'not applicable' in low:
+        if not all(s == 'NOT APPLICABLE' for s in statuses):
+            return True
+    if all(s == 'NOT APPLICABLE' for s in statuses):
+        requests_action = any(phrase in low for phrase in (
+            'fill the official', 'submit the official', 'send an accommodation request',
+            'draft an accommodation request', 'request your accommodations'
+        ))
+        if requests_action and 'no accommodation request' not in low:
+            return True
+    return False
+
+
+def _fallback_message(event: dict, rows: list[dict]) -> str:
+    name = event.get('name') or 'this event'
+    statuses = [row.get('status') for row in rows]
+    if statuses and all(s == 'CONFIRMED' for s in statuses):
+        return f'All of your saved accessibility needs are confirmed for {name}.'
+    if statuses and all(s == 'NOT APPLICABLE' for s in statuses):
+        return f'All of your saved accessibility needs are not applicable to the format of {name}.'
+    if statuses and all(s == 'NOT CONFIRMED' for s in statuses):
+        return f'None of your saved accessibility needs are confirmed for {name}.'
+    if statuses and all(s == 'UNKNOWN' for s in statuses):
+        return f'Accessly could not verify your saved accessibility needs for {name}.'
+    return f'Accessly checked your saved accessibility needs for {name}; review the individual statuses below.'
+
+
+def _assisted_form_recommendation(action: dict) -> None:
+    """Keep the UI clear that Accessly fills forms rather than sending users away."""
+    form = action.get('official_form')
+    recommendation = action.get('recommendation')
+    if not form or not recommendation:
+        return
+    low = normalized(recommendation).lower()
+    if any(phrase in low for phrase in ('no accommodation request', 'already occurred', 'past event')):
+        return
+    if any(word in low for word in ('form', 'submit', 'fill', 'complete')):
+        action['recommendation'] = (
+            'Accessly can fill the official accommodation form for you using verified event details '
+            'and your saved accessibility needs, then show you exactly what will be submitted for '
+            'your approval before submission.'
+        )
+
+
 def supported(fact: Fact | None, report: str) -> str | None:
     if fact and normalized(fact.value) and normalized(fact.value) in normalized(report):
         value = fact.value.strip()
@@ -80,10 +227,83 @@ def supported(fact: Fact | None, report: str) -> str | None:
             return value
     return None
 
+def _is_meta_recommendation(value: str | None) -> bool:
+    if not value:
+        return False
+    lowered = normalized(value).lower()
+    phrases = (
+        'ask accessly',
+        'let me know',
+        'would you like me to',
+        'i can help',
+        'ask me about the next step',
+        'tell me how you want to proceed',
+    )
+    return any(phrase in lowered for phrase in phrases)
+
+def _contact_from_recommendation(value: str | None) -> str | None:
+    """Recover a contact already used in the report's concrete recommendation."""
+    if not value:
+        return None
+    email_match = re.search(r'[^\s<>]+@[^\s<>]+\.[^\s<>]+', value)
+    if email_match:
+        return email_match.group(0).rstrip('.,);]')
+    phone_match = re.search(r'\+[0-9][0-9() .-]{7,}[0-9]', value)
+    if phone_match:
+        return phone_match.group(0).strip().rstrip('.,);]')
+    return None
+
+
+def _explicit_action_section(report: str) -> dict[str, str | None]:
+    """Recover action fields from an explicit report section when formatter misses them."""
+    result = {"official_contact": None, "recommendation": None}
+    lines = report.splitlines()
+
+    # Contact: prefer a line near an explicit contact/action heading rather than
+    # scanning arbitrary event prose for phone numbers.
+    for idx, line in enumerate(lines):
+        low = normalized(line).lower()
+        if any(label in low for label in (
+            "official contact", "contact / form", "contact/form",
+            "official contact / form", "request action"
+        )):
+            block = "\n".join(lines[idx: min(len(lines), idx + 8)])
+            email_match = re.search(r'[^\s<>]+@[^\s<>]+\.[^\s<>]+', block)
+            if email_match:
+                result["official_contact"] = email_match.group(0).rstrip('.,);]')
+                break
+            phone_match = re.search(r'\+[0-9][0-9() .-]{7,}[0-9]', block)
+            if phone_match:
+                result["official_contact"] = phone_match.group(0).strip().rstrip('.,);]')
+                break
+
+    # Recommendation: copy only text explicitly placed under a recommendation
+    # label. Never synthesize a next step here.
+    for idx, line in enumerate(lines):
+        low = normalized(line).lower()
+        if "recommended action" not in low and "recommendation" not in low:
+            continue
+        values = []
+        for candidate in lines[idx + 1: min(len(lines), idx + 7)]:
+            clean = normalized(candidate)
+            if not clean:
+                continue
+            if re.match(r'^(event details|accessibility check|request action|email draft)\b', clean, flags=re.I):
+                break
+            values.append(clean)
+            if len(" ".join(values)) >= 320:
+                break
+        if values:
+            result["recommendation"] = " ".join(values)[:500]
+            break
+
+    return result
+
 def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: str | None, previous: dict | None = None) -> dict:
     previous = previous or {}
     event = dict(previous.get('event') or {})
     event_sources = dict(previous.get('event_sources') or {})
+
     for field in EventFacts.model_fields:
         fact = getattr(extracted.event, field)
         value = supported(fact, report)
@@ -93,36 +313,129 @@ def serialize(extracted: ExtractedResult, report: str, needs: list[str], url: st
         else:
             event.setdefault(field, None)
     event['url'] = url
-    previous_needs = {item['name']: item for item in previous.get('accessibility_results', [])}
-    assessments = {}
+
+    need_lookup = _saved_need_lookup(needs)
+    previous_needs = {
+        normalized(item.get('name', '')).casefold(): item
+        for item in previous.get('accessibility_results', [])
+        if item.get('name')
+    }
+    assessments: dict[str, dict] = {}
+
+    # First accept formatter output, but match need names case-insensitively and
+    # always preserve the exact spelling stored in the user's profile.
     for item in extracted.accessibility_results:
-        if item.name not in needs or not item.source_quote or normalized(item.source_quote) not in normalized(report):
+        canonical = need_lookup.get(normalized(item.name).casefold())
+        if not canonical or not item.source_quote or normalized(item.source_quote) not in normalized(report):
             continue
-        # Confirm the stated classification in evidence, not just a model-produced enum.
+
         quote = item.source_quote
-        for line in report.splitlines():
-            if normalized(item.source_quote) in normalized(line) and normalized(item.name) in normalized(line):
-                quote = line
-                break
-        classifications = re.findall(r'\b(?:NOT CONFIRMED|NOT APPLICABLE|CONFIRMED|UNKNOWN)\b', re.sub(re.escape(normalized(item.name)), '', normalized(quote), count=1, flags=re.I).upper())
-        if not classifications or item.status != classifications[0]:
+        status_from_quote = _status_in_text(quote)
+        if status_from_quote != item.status:
+            # Some reports put the need heading and status on adjacent lines.
+            fallback_status, fallback_excerpt = _individual_need_excerpt(report, canonical, needs)
+            if fallback_status != item.status:
+                continue
+            quote = fallback_excerpt or quote
+
+        assessments[canonical] = {
+            'name': canonical,
+            'status': item.status,
+            'evidence': item.evidence,
+            'source_quote': quote,
+        }
+
+    # Deterministic fallback for any need the formatter failed to serialize.
+    # This fixes cases where the report was correct but capitalization or a
+    # heading/status split caused the presentation layer to show UNKNOWN.
+    for need in needs:
+        if need in assessments:
             continue
-        assessments[item.name] = {'name': item.name, 'status': item.status, 'evidence': item.evidence, 'source_quote': quote}
-    rows = [assessments.get(name) or previous_needs.get(name) or {'name': name, 'status': 'UNKNOWN', 'evidence': 'The agent has not verified this need.', 'source_quote': None} for name in needs]
-    action = {field: supported(getattr(extracted.recommended_action, field), report) for field in ActionFacts.model_fields}
+        status, excerpt = _individual_need_excerpt(report, need, needs)
+        if status:
+            assessments[need] = {
+                'name': need,
+                'status': status,
+                'evidence': _evidence_from_excerpt(excerpt, need, status),
+                'source_quote': excerpt,
+            }
+
+    rows = []
+    for name in needs:
+        previous_row = previous_needs.get(normalized(name).casefold())
+        rows.append(
+            assessments.get(name)
+            or previous_row
+            or {
+                'name': name,
+                'status': 'UNKNOWN',
+                'evidence': 'The agent has not verified this need.',
+                'source_quote': None,
+            }
+        )
+
+    action = {
+        field: supported(getattr(extracted.recommended_action, field), report)
+        for field in ActionFacts.model_fields
+    }
     if not action['recommendation'] and extracted.recommended_action.recommendation:
         quote = extracted.recommended_action.recommendation.source_quote
         if normalized(quote) and normalized(quote) in normalized(report):
             action['recommendation'] = normalized(quote)
+    if _is_meta_recommendation(action.get('recommendation')):
+        action['recommendation'] = None
+
+    explicit_action = _explicit_action_section(report)
+    if not action.get('official_contact') and explicit_action.get('official_contact'):
+        action['official_contact'] = explicit_action['official_contact']
+    if not action.get('recommendation') and explicit_action.get('recommendation'):
+        action['recommendation'] = explicit_action['recommendation']
+
+    all_not_applicable = bool(rows) and all(
+        row.get('status') == 'NOT APPLICABLE' for row in rows
+    )
+
+    if not all_not_applicable:
+        _assisted_form_recommendation(action)
+    else:
+        action['recommendation'] = (
+            'No accommodation request is needed based on your current saved needs.'
+        )
+
     draft = None
-    if extracted.draft:
+    if extracted.draft and not all_not_applicable:
         candidate = extracted.draft
-        if re.fullmatch(r'[^\s<>]+@[^\s<>]+\.[^\s<>]+', candidate.to) and all(normalized(value) and normalized(value) in normalized(report) for value in [candidate.to, candidate.subject, candidate.body]):
+        if re.fullmatch(r'[^\s<>]+@[^\s<>]+\.[^\s<>]+', candidate.to) and all(
+            normalized(value) and normalized(value) in normalized(report)
+            for value in [candidate.to, candidate.subject, candidate.body]
+        ):
             draft = candidate.model_dump()
             draft['body'] = plain_email(draft['body'])
-    return {'schema_version': 1, 'presentation_status': 'ready', 'message': extracted.message, 'event': event,
-            'event_sources': event_sources, 'accessibility_results': rows, 'recommended_action': action,
-            'draft': draft, 'requests': []}
+
+    # If the same report already uses a verified contact in its recommendation
+    # or draft, keep the displayed Official contact field consistent with it.
+    if not action.get('official_contact'):
+        recovered_contact = draft.get('to') if draft else None
+        if not recovered_contact:
+            recovered_contact = _contact_from_recommendation(action.get('recommendation'))
+        if recovered_contact and normalized(recovered_contact) in normalized(report):
+            action['official_contact'] = recovered_contact
+
+    message = extracted.message
+    if _message_contradicts_rows(message, rows):
+        message = _fallback_message(event, rows)
+
+    return {
+        'schema_version': 1,
+        'presentation_status': 'ready',
+        'message': message,
+        'event': event,
+        'event_sources': event_sources,
+        'accessibility_results': rows,
+        'recommended_action': action,
+        'draft': draft,
+        'requests': [],
+    }
 
 def format_result(report: str, needs: list[str], url: str | None, model, previous: dict | None = None) -> dict:
     import json

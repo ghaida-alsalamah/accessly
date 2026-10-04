@@ -1,0 +1,31 @@
+## Event Details
+**Event name:** Inclusive Tech Day
+**Date:** October 15, 2026
+**Location:** Riyadh
+**Organizer:** Tech Collective
+
+## Accessibility Needs
+| Need | Status | Evidence |
+| --- | --- | --- |
+| Wheelchair access | CONFIRMED | Step-free entry is listed on the official page. |
+| Live captions | NOT CONFIRMED | The page does not mention captions. |
+| Accessible parking | NOT APPLICABLE | This session is online. |
+
+## Accommodation Request
+Official contact: access@example.com
+Timing: Preferably seven days before the event.
+Recommended action: Request captions.
+
+## Request Draft
+To: access@example.com
+Subject: Accessibility Accommodation Request
+Body:
+Dear organizer,
+
+Please provide Live captions.
+
+Thank you,
+Demo attendee
+
+## Approval required
+Please review this draft before sending.

@@ -5,7 +5,11 @@ from datetime import date, datetime
 import smtplib
 import ssl
 import unicodedata
+import re
+import html as html_lib
+from copy import deepcopy
 from email.message import EmailMessage
+from email.utils import parseaddr
 import imaplib
 import email
 from email.header import decode_header
@@ -18,32 +22,142 @@ load_dotenv()
 sent_requests = []
 browser = LocalChromiumBrowser()
 
+# Public event research contains no user-private data, so caching the same
+# event URL avoids repeated Firecrawl calls within the same process.
+_RESEARCH_EVENT_CACHE = {}
+
 @tool
-def check_event_timing(event_date: str, preferred_notice_days: int):
+def research_event(event_url: str):
     """
-    Check the timing of an event and whether the preferred accommodation
-    notice window is still open.
+    Research one event from the ORIGINAL event URL supplied by the user.
+
+    Call this tool exactly once per event analysis. It already performs the
+    event-page retrieval, relevant official-link inspection, and official-domain
+    search fallback through Accessly's web retrieval layer.
+
+    Do not call this tool again with links returned by this tool.
+    """
+
+    normalized_url = event_url.strip().rstrip("/")
+
+    if normalized_url in _RESEARCH_EVENT_CACHE:
+        cached = deepcopy(_RESEARCH_EVENT_CACHE[normalized_url])
+        cached["cache_hit"] = True
+        return cached
+
+    try:
+        from web_retrieval import research_event as retrieve_event
+        result = retrieve_event(event_url)
+
+        if isinstance(result, dict):
+            result = deepcopy(result)
+            result.setdefault("cache_hit", False)
+            result["research_complete"] = result.get("status") == "success"
+            retrieval_guidance = str(result.get("tool_guidance") or "").strip()
+            wrapper_guidance = (
+                "Event web research is complete for this URL. Do not call "
+                "research_event again for links discovered in this result. "
+                "Use the returned evidence. Use the browser only for an "
+                "interactive form/page or when retrieval failed."
+            )
+            # Preserve retrieval-layer guidance instead of replacing it. The
+            # retrieval layer may provide important source-freshness and fact
+            # extraction hints for long or recurring event pages.
+            result["tool_guidance"] = " ".join(
+                part for part in (retrieval_guidance, wrapper_guidance) if part
+            )
+
+            if result.get("status") == "success":
+                _RESEARCH_EVENT_CACHE[normalized_url] = deepcopy(result)
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "failed",
+            "event_url": event_url,
+            "error_type": type(e).__name__,
+            "error": str(e),
+            "message": (
+                "The event could not be researched with the primary "
+                "web retrieval layer. Use the browser only as a fallback."
+            )
+        }
+
+
+@tool
+def check_event_timing(
+    event_date: str,
+    preferred_notice_days: int | None = None,
+    event_end_date: str | None = None
+):
+    """
+    Check an event's lifecycle and, when provided, its accommodation notice window.
 
     Args:
-        event_date: Event date in YYYY-MM-DD format.
-        preferred_notice_days: Number of days of advance notice requested.
+        event_date: Event start date in YYYY-MM-DD format.
+        preferred_notice_days: Optional number of days of advance notice stated by
+            the organizer. Pass None when no notice period is stated.
+        event_end_date: Optional event end date in YYYY-MM-DD format for multi-day
+            events.
     """
 
-    event = datetime.strptime(event_date, "%Y-%m-%d").date()
-    today = date.today()
-
-    days_until_event = (event - today).days
-    notice_deadline = event.fromordinal(
-        event.toordinal() - preferred_notice_days
+    start = datetime.strptime(event_date, "%Y-%m-%d").date()
+    end = (
+        datetime.strptime(event_end_date, "%Y-%m-%d").date()
+        if event_end_date
+        else start
     )
 
-    return {
-        "event_date": event.isoformat(),
-        "day_of_week": event.strftime("%A"),
-        "days_until_event": days_until_event,
-        "preferred_notice_deadline": notice_deadline.isoformat(),
-        "preferred_window_passed": today > notice_deadline
+    if end < start:
+        raise ValueError("event_end_date cannot be before event_date.")
+
+    today = date.today()
+
+    if today > end:
+        event_status = "PAST"
+    elif start <= today <= end:
+        event_status = "ONGOING" if end > start else "TODAY"
+    else:
+        event_status = "UPCOMING"
+
+    result = {
+        "today": today.isoformat(),
+        "event_date": start.isoformat(),
+        "event_end_date": end.isoformat() if event_end_date else None,
+        "day_of_week": start.strftime("%A"),
+        "days_until_event": (start - today).days,
+        "days_until_end": (end - today).days,
+        "event_status": event_status,
+        "event_has_passed": event_status == "PAST",
+        "preferred_notice_days": preferred_notice_days,
+        "preferred_notice_deadline": None,
+        "preferred_window_passed": None,
+        "notice_window_status": None,
     }
+
+    if preferred_notice_days is not None:
+        if preferred_notice_days < 0:
+            raise ValueError("preferred_notice_days cannot be negative.")
+
+        notice_deadline = start.fromordinal(
+            start.toordinal() - preferred_notice_days
+        )
+
+        if today > notice_deadline:
+            notice_status = "PASSED"
+        elif today == notice_deadline:
+            notice_status = "DUE_TODAY"
+        else:
+            notice_status = "OPEN"
+
+        result.update({
+            "preferred_notice_deadline": notice_deadline.isoformat(),
+            "preferred_window_passed": today > notice_deadline,
+            "notice_window_status": notice_status,
+        })
+
+    return result
 
 @tool
 def check_event_accessibility(event_url: str):
@@ -55,9 +169,6 @@ def check_event_accessibility(event_url: str):
         "accessible_entrance": "East Gate",
         "event_url": event_url
     }
-
-PROFILE_FILE = Path("user_profile.json")
-
 
 PROFILE_FILE = Path("user_profile.json")
 
@@ -204,17 +315,77 @@ def decode_email_header(value):
 
 
 def normalize_subject(subject):
-    """Normalize a subject so reply prefixes and Unicode don't break matching."""
-    subject = unicodedata.normalize("NFKC", subject)
-    subject = subject.replace("\xa0", " ").strip()
+    """Normalize email subjects so normal reply/forward prefixes do not break matching."""
+    subject = unicodedata.normalize("NFKC", subject or "")
+    subject = subject.replace("\xa0", " " ).strip()
 
-    lowered = subject.lower()
+    # Remove one or more common reply/forward prefixes, e.g.
+    # Re:, RE:, Fwd:, FW:, Re: Re:
+    subject = re.sub(
+        r"^(?:(?:re|fw|fwd)\s*:\s*)+",
+        "",
+        subject,
+        flags=re.IGNORECASE
+    )
 
-    # Remove common reply prefix
-    if lowered.startswith("re:"):
-        subject = subject[3:].strip()
+    return " ".join(subject.split()).strip()
 
-    return subject
+
+def extract_accessly_reference(subject):
+    """Return the stable [Accessly ...] thread marker when present."""
+    match = re.search(
+        r"\[Accessly\s+[^\]]+\]",
+        subject or "",
+        flags=re.IGNORECASE
+    )
+    return match.group(0).casefold() if match else None
+
+
+def extract_email_body(msg):
+    """Prefer text/plain, with a safe text/html fallback for HTML-only replies."""
+
+    plain_parts = []
+    html_parts = []
+
+    parts = msg.walk() if msg.is_multipart() else [msg]
+
+    for part in parts:
+        content_disposition = (part.get("Content-Disposition") or "").lower()
+
+        if "attachment" in content_disposition:
+            continue
+
+        content_type = part.get_content_type()
+
+        if content_type not in ("text/plain", "text/html"):
+            continue
+
+        payload = part.get_payload(decode=True)
+
+        if not payload:
+            continue
+
+        text = payload.decode(
+            part.get_content_charset() or "utf-8",
+            errors="replace"
+        )
+
+        if content_type == "text/plain":
+            plain_parts.append(text)
+        else:
+            html_parts.append(text)
+
+    if plain_parts:
+        return "\n".join(plain_parts).strip()
+
+    if html_parts:
+        html_text = "\n".join(html_parts)
+        html_text = re.sub(r"<br\s*/?>", "\n", html_text, flags=re.IGNORECASE)
+        html_text = re.sub(r"</p\s*>", "\n", html_text, flags=re.IGNORECASE)
+        html_text = re.sub(r"<[^>]+>", " ", html_text)
+        return html_lib.unescape(html_text).strip()
+
+    return ""
 
 
 @tool
@@ -234,9 +405,9 @@ def check_organizer_reply(request_id: str):
             "request_id": request_id
         }
 
-    stored_subject = normalize_subject(
-        request_record["email_subject"]
-    )
+    stored_subject_raw = request_record.get("email_subject", "")
+    stored_subject = normalize_subject(stored_subject_raw)
+    stored_reference = extract_accessly_reference(stored_subject_raw)
 
     accessly_email = "".join(
         os.environ["ACCESSLY_EMAIL"].split()
@@ -249,91 +420,98 @@ def check_organizer_reply(request_id: str):
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
         mail.login(accessly_email, password)
-        mail.select("inbox")
 
-        # Fast ASCII-only search to avoid UnicodeEncodeError
-        status, messages = mail.search(
-            None,
-            'SUBJECT',
-            '"Accessibility Accommodation Request"'
-        )
+        status, _ = mail.select("inbox")
 
         if status != "OK":
             mail.logout()
             return {
                 "status": "failed",
                 "request_id": request_id,
-                "message": "Could not search inbox."
+                "message": "Could not open the Accessly inbox."
+            }
+
+        # IMPORTANT: do not pre-filter by a hard-coded subject phrase.
+        # Accessly subjects can vary by event and include a unique [Accessly ...]
+        # reference. Search recent inbox messages, then match the real stored
+        # thread subject/reference ourselves.
+        status, messages = mail.search(None, "ALL")
+
+        if status != "OK":
+            mail.logout()
+            return {
+                "status": "failed",
+                "request_id": request_id,
+                "message": "Could not search the Accessly inbox."
             }
 
         email_ids = messages[0].split()
 
-        if not email_ids:
-            mail.logout()
-            return {
-                "status": "no_reply",
-                "request_id": request_id
-            }
+        # A recent reply should be near the end. Limiting the scan avoids walking
+        # a very large mailbox while still being much more robust than the old
+        # hard-coded SUBJECT search.
+        recent_email_ids = email_ids[-500:]
 
-        # Newest matching messages first
-        for email_id in reversed(email_ids):
+        for email_id in reversed(recent_email_ids):
 
-            # Fetch headers only first — much faster
             status, header_data = mail.fetch(
                 email_id,
                 "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])"
             )
 
-            if status != "OK":
+            if status != "OK" or not header_data or not header_data[0]:
                 continue
 
             header_bytes = header_data[0][1]
+
+            if not header_bytes:
+                continue
+
             header_msg = email.message_from_bytes(header_bytes)
 
             subject = decode_email_header(
                 header_msg.get("Subject", "")
             )
 
-            if normalize_subject(subject) != stored_subject:
+            sender = decode_email_header(
+                header_msg.get("From", "")
+            )
+
+            sender_email = parseaddr(sender)[1].strip().casefold()
+
+            # Ignore messages from Accessly itself if any happen to be present.
+            if sender_email == accessly_email.casefold():
                 continue
 
-            # Only now fetch the full matching email
+            received_reference = extract_accessly_reference(subject)
+
+            if stored_reference:
+                # Best match: the stable Accessly reference survives normal
+                # Re:/Fwd: prefixes and small subject edits.
+                if received_reference != stored_reference:
+                    continue
+            else:
+                # Backward-compatible fallback for older request records that
+                # were created before Accessly references were added.
+                if normalize_subject(subject).casefold() != stored_subject.casefold():
+                    continue
+
+            # Fetch the complete message only after the thread matches.
             status, msg_data = mail.fetch(
                 email_id,
                 "(RFC822)"
             )
 
-            if status != "OK":
+            if status != "OK" or not msg_data or not msg_data[0]:
                 continue
 
             raw_email = msg_data[0][1]
+
+            if not raw_email:
+                continue
+
             msg = email.message_from_bytes(raw_email)
-
-            sender = decode_email_header(
-                msg.get("From", "")
-            )
-
-            body = ""
-
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        payload = part.get_payload(decode=True)
-
-                        if payload:
-                            body = payload.decode(
-                                part.get_content_charset() or "utf-8",
-                                errors="replace"
-                            )
-                            break
-            else:
-                payload = msg.get_payload(decode=True)
-
-                if payload:
-                    body = payload.decode(
-                        msg.get_content_charset() or "utf-8",
-                        errors="replace"
-                    )
+            body = extract_email_body(msg)
 
             mail.logout()
 
@@ -342,14 +520,15 @@ def check_organizer_reply(request_id: str):
                 "request_id": request_id,
                 "from": sender,
                 "subject": subject,
-                "body": body.strip()
+                "body": body
             }
 
         mail.logout()
 
         return {
             "status": "no_reply",
-            "request_id": request_id
+            "request_id": request_id,
+            "checked_messages": len(recent_email_ids)
         }
 
     except Exception as e:
@@ -359,6 +538,7 @@ def check_organizer_reply(request_id: str):
             "error_type": type(e).__name__,
             "error": str(e)
         }
+
 
 @tool
 def confirm_accommodation(request_id: str):
@@ -443,10 +623,6 @@ def create_request_record(
         "status": "created",
         "request": record
     }
-    requests.append(record)
-    save_requests(requests)
-
-    return record
 
 @tool
 def update_request_status(
@@ -482,6 +658,7 @@ def update_request_status(
 agent = Agent(
     tools=[
     get_user_accessibility_needs,
+    research_event,
     check_event_timing,
     browser.browser,
     send_accommodation_email,
@@ -498,16 +675,61 @@ official next step.
 
 Use get_user_accessibility_needs to retrieve the user's saved accessibility needs.
 
-Use the browser tool to inspect the official event webpage provided by the user.
+Use research_event as the PRIMARY way to inspect an event URL and collect
+official event/accessibility evidence.
+
+research_event may return:
+- primary_source: the content retrieved from the exact event URL
+- related_sources: relevant pages discovered from official links or
+  official-domain search
+- retrieval_methods: how the evidence was obtained
+- errors: retrieval problems encountered
+
+Treat primary_source and related_sources as evidence returned by a tool.
+
+Use the browser tool only as a FALLBACK when:
+- research_event returns status other than "success"
+- a relevant page could not be accessed by research_event
+- an accommodation form or other interactive page must be inspected or filled
+- user interaction with a webpage is actually required
+
+Do not reopen the same event page with the browser merely to duplicate or
+re-check evidence that research_event already retrieved successfully.
+
+
+WEB RESEARCH CALL RULES
+
+For each event analysis:
+
+- Call research_event EXACTLY ONCE.
+- Pass only the ORIGINAL event URL supplied by the user.
+- Never call research_event again with a URL returned by research_event.
+- Do not call research_event separately for venue, Plan Your Visit, contact,
+  registration, accessibility, or accommodation-form links discovered in the result.
+- research_event already performs official linked-page inspection and an
+  official-domain search fallback when needed.
+- If research_event returns status="success", treat the returned evidence as
+  the completed research package for that event.
+- Use the browser only when research_event failed, or when an interactive form/page
+  must actually be inspected or filled.
+- Never claim that the entire official website was checked. If no accessibility
+  evidence is found, say: "No explicit evidence was found in the official pages
+  retrieved and checked."
 
 
 YOUR WORKFLOW
 
 1. Retrieve the user's saved accessibility needs.
 
-2. Inspect the official event webpage.
+2. Call research_event on the exact event URL provided by the user.
 
-3. Identify, when available:
+3. Review the primary_source and any related_sources returned by research_event.
+
+4. If research_event failed to access relevant information, use the browser
+   as a fallback for the inaccessible page. If research_event succeeded,
+   do not use the browser unless an interactive form or page must be inspected.
+
+5. Identify, when available:
    - event name
    - event date and time
    - location
@@ -516,40 +738,51 @@ YOUR WORKFLOW
    - official accommodation request process
    - official accessibility or organizer contact information
 
-4. Compare every saved accessibility need against what is explicitly confirmed
-   on the official event webpage.
+6. Compare every saved accessibility need against what is explicitly confirmed
+   by the evidence returned from the exact event page or relevant official sources.
 
-5. Classify each need as:
+7. Classify each need as:
    - CONFIRMED: explicitly supported by official information
-   - NOT CONFIRMED: not explicitly stated
-   - UNKNOWN: the relevant information could not be accessed or verified
+   - NOT CONFIRMED: the official event information was successfully accessed,
+     but that specific accommodation was not explicitly confirmed
+   - UNKNOWN: the relevant source or information could not be accessed or
+     reliably verified
 
-6. If one or more required accommodations are not confirmed:
-   - look for an official accommodation form
+Do not classify a need as UNKNOWN merely because research_event found no
+accessibility statement. If research_event successfully accessed the official
+event information but found no explicit evidence for that need, use
+NOT CONFIRMED.
+
+8. If one or more required accommodations are not confirmed:
+   - inspect the evidence returned by research_event for an official
+     accommodation form
    - accessibility page
    - accessibility email
-   - or organizer contact listed on the official event page
+   - or organizer contact
+   - use the browser only when an interactive page or form needs inspection
 
-7. If an official accommodation form exists:
+9. If an official accommodation form exists and the event is not PAST:
 open and inspect the form
 identify all required fields
-use verified event information when filling event-related fields
-use saved user profile information when available
-use the user's exact saved accessibility needs
-if required personal information is missing, ask the user for it
+fill every field that can be completed from verified event information, the saved user profile,
+and the user's exact saved accessibility needs
+do not make the user manually re-enter information Accessly already has
+if required personal information is missing, fill the known fields first and then ask only for
+the specific missing required fields
 never guess or invent missing personal information
-You MAY fill the form fields after all required information is available.
 After filling the form:
 do NOT click Submit yet
-show the user a summary of exactly what was entered
+show the user a summary of exactly what Accessly entered
 ask for explicit approval before submission
-If authentication prevents access to the form:
-report the inaccessible fields as UNKNOWN
-look for an official alternative contact method
+The user experience must make clear that Accessly fills the form for the user; do not simply
+tell the user to open, use, complete, or submit the form manually when Accessly can access it.
+If authentication, CAPTCHA, or another technical block prevents Accessly from filling the form:
+state that clearly, report any inaccessible fields as UNKNOWN when appropriate, and offer the
+verified alternative official contact method if one exists.
 
-8. If the primary accommodation channel cannot be accessed and an official
-   alternative contact method is available on the event page, use that
-   verified alternative as the next available path.
+10. If the primary accommodation channel cannot be accessed and an official
+    alternative contact method is available in the verified evidence, use that
+    verified alternative as the next available path.
 
 
 EVIDENCE AND HALLUCINATION RULES
@@ -579,22 +812,40 @@ Never claim an accommodation is confirmed unless there is explicit evidence.
 
 DATE AND TIMING RULES
 
-Never calculate dates, weekdays, notice periods, deadlines, or date differences
-yourself.
+Never calculate dates, weekdays, notice periods, deadlines, event lifecycle,
+or date differences yourself.
 
-If the event provides an advance-notice requirement or recommendation,
-use check_event_timing.
+Whenever an event date is available, ALWAYS call check_event_timing exactly once
+for that event analysis, even when no accommodation notice period is stated.
 
 When calling check_event_timing:
-- normalize the observed event date to YYYY-MM-DD
-- pass the number of preferred or required notice days stated by the organizer
+- normalize the observed event START date to YYYY-MM-DD
+- for a multi-day event, also pass event_end_date in YYYY-MM-DD
+- if the organizer states an advance-notice period, pass its number of days
+- if no notice period is stated, omit preferred_notice_days or pass None
 
-Use the result returned by check_event_timing for:
-- event date
-- day of week
-- days until the event
-- preferred notice date
-- whether the notice window has passed
+The values returned by check_event_timing are authoritative. In particular, use:
+- event_status exactly as returned: UPCOMING, TODAY, ONGOING, or PAST
+- notice_window_status exactly as returned: OPEN, DUE_TODAY, PASSED, or None
+- preferred_notice_deadline exactly as returned
+- event_has_passed exactly as returned
+
+Never override, reinterpret, or recalculate these fields in prose.
+
+If event_status is PAST:
+- clearly state that the event has already occurred
+- do NOT recommend sending an accommodation request for that event
+- do NOT draft an accommodation email for that event
+- do NOT recommend filling an accommodation form for that event
+- the recommended action must state that no current accommodation request should
+  be initiated for the past event
+- only mention recordings, future events, or general follow-up if an official
+  source actually provides a relevant channel; do not invent one
+
+If notice_window_status is OPEN, explicitly say the notice window is still open.
+If it is DUE_TODAY, explicitly say the notice date is today.
+If it is PASSED, state that the stated notice period has passed.
+If it is None, do not invent a notice period.
 
 If the official source says words such as:
 - "preferably"
@@ -603,14 +854,116 @@ If the official source says words such as:
 
 describe the period as a preferred or recommended notice window.
 
-Do NOT call it a deadline unless the official source explicitly states
-that it is mandatory.
+If the source instead says wording such as "at least one week prior" or
+"requests must be submitted X days before", preserve that wording and do NOT
+relabel it as merely preferred unless the source itself says so.
 
-If preferred_window_passed is true, state that the request is being made
-after or outside the preferred notice period.
+Do NOT call it a hard deadline unless the official source explicitly states
+that requests after that date are not accepted.
 
 Do not claim that a late request can or cannot be accommodated unless the
 official organizer explicitly states this.
+
+
+EVENT FACT PRIORITY
+
+For event name, date, time, location, organizer, and format, prefer evidence in this order:
+1. the exact event page supplied by the user
+2. an event-specific official FAQ, visitor, venue, or registration page
+3. another official page clearly describing the same event
+4. general site-wide organization information
+
+Do not infer the event organizer from a parent company, footer brand, copyright line,
+or website platform. If an official source explicitly says "organized by", "organised by",
+"hosted by", or equivalent, that explicit statement wins.
+
+Do not report "Not stated by the organizer" for time, organizer, format, or contact if
+any retrieved official source explicitly provides that field. Before finalizing the report:
+- scan primary_source and all related_sources
+- inspect each page's event_fact_snippets, especially time/date/contact snippets
+- for time, look for opening hours, show hours, visiting hours, daily timings, schedule,
+  visitor information, and planning/preparation pages; preserve different hours by day
+- inspect preferred_contact_candidates before saying no official contact was found
+
+The retrieval layer may return event_year_hint plus year_relevance on each source. Treat
+these as ranking hints, not as final facts. If multiple official pages conflict, prefer the
+most event-specific and current source. An exact-event or current/undated official source
+should normally outrank an older_year_only source. Do not silently combine facts from
+different event editions. If a source is explicitly tied only to an older edition, do not
+present its accessibility provision, time, deadline, or contact as current unless a current
+official source corroborates it. If it is the only evidence available, state that it belongs
+to an older edition rather than silently treating it as current.
+
+
+SOURCE AND CONTACT PRIORITY
+
+When multiple official sources or contact channels are available, prefer them in
+this order:
+1. event-specific accommodation instructions linked from the exact event page
+2. event-specific accessibility contact or accommodation form
+3. a clearly event-specific organizer/customer-service contact
+4. site-wide accessibility/disability office guidance
+5. a current dedicated official contact/customer-service page for the event or organizer
+6. another current general organization or communications contact
+
+Use preferred_contact_candidates as the first contact shortlist, then consult the full
+contact_candidates list only when needed. Treat ranking_score, source_role, year relevance,
+and candidate context as hints together rather than blindly preferring the first contact
+seen on the homepage. A current dedicated Contact / Customer Service page can outrank a
+generic homepage widget when the dedicated page gives a clearer current contact channel.
+A candidate from an older_year_only source should not outrank a current or undated official
+contact merely because it appears in a search result. Also inspect each candidate's context:
+do not choose a phone/email that belongs to a sponsor, exhibitor, speaker, unrelated
+department, or historical campaign unless the surrounding official text shows it is an
+appropriate contact for this event.
+
+The Official contact / form field, the Recommended action, and any email draft must be
+consistent with each other. If the final recommendation or draft uses a verified official
+email/phone/form, do not simultaneously report that no official contact/form was stated.
+
+Do not describe a general communications or organizer email as an accessibility
+contact unless the source explicitly says it handles accessibility or accommodation
+requests. Label the contact type accurately in the report, for example:
+- Accessibility contact
+- Event organizer contact
+- General organization contact
+
+If two official sources give different accommodation instructions, use the more
+event-specific and current instruction and mention the broader instruction only as
+secondary context. Do not silently merge conflicting deadlines or contacts.
+
+
+RECOMMENDED ACTION RULES
+
+The Recommended action must always be a concrete next step based on verified
+official channels. Never write vague meta-text such as:
+- "Ask Accessly about the next step"
+- "Let me know how you want to proceed"
+- "I can help if you want"
+
+Use this priority unless event_status is PAST:
+1. If an official event-specific accommodation form exists and Accessly can access it, say that
+   Accessly can fill the official form for the user using verified event details and saved needs,
+   then show the completed entries for explicit approval before submission. Do NOT phrase this as
+   a manual instruction such as "Use the form" or "Submit the form".
+2. If the form exists but cannot be accessed because of authentication, CAPTCHA, or another
+   technical block, state that block and recommend the best verified alternative channel.
+3. Otherwise, if an accessibility-specific email/contact exists, recommend contacting it.
+4. Otherwise, if an event-specific organizer contact exists, recommend contacting it.
+5. Otherwise, if only a general organization contact exists, recommend it only as a
+   fallback and label it as general.
+6. If no verified channel exists, say that no verified accommodation request channel
+   was found in the official sources checked.
+
+For a hybrid event, physical accessibility needs remain applicable because an
+in-person attendance option exists. Only classify physical needs as NOT APPLICABLE
+when the event is fully virtual with no physical attendance option.
+
+If every saved need is NOT APPLICABLE for the event format, do not recommend sending an
+accommodation email or filling an accommodation form for those saved needs. The concrete
+recommended action should say that no accommodation request is needed based on the user's
+current saved needs. You may still report an official accessibility channel as informational
+context if one was verified.
 
 
 EVENT DATE CONSISTENCY
@@ -652,6 +1005,13 @@ ASL interpretation, or another service.
 
 
 EMAIL DRAFTING
+
+Do not draft an accommodation email when check_event_timing returned
+event_status="PAST".
+
+If an official event-specific accommodation form exists, recommend that form as
+the primary next step. Draft an email instead only when no usable official form
+exists, or when the user explicitly asks to use email.
 
 If one or more required accommodations are not confirmed and an official
 organizer or accessibility email is available:
@@ -757,10 +1117,12 @@ check_organizer_reply using the request_id, for example REQ-001.
 
 Do not use the request ID itself as an email subject search term.
 
-check_organizer_reply resolves the stored email subject
-from the request record automatically.
+check_organizer_reply resolves the stored email thread from the request record
+automatically, including the Accessly reference when present.
 
-If no reply is found, report that the request remains pending.
+If no reply is found, report that the request remains pending. Do not claim that
+the inbox contains no reply in general; only say that no matching reply was found
+for that tracked request.
 
 If a reply is found:
 1. read the organizer's response carefully
@@ -812,6 +1174,21 @@ stored in the request.
    update_request_status returns status="updated".
 
 
+OUTPUT CONSISTENCY
+
+Before producing the final report, create exactly one explicit assessment line for every saved need
+using this format:
+<exact saved need>: <CONFIRMED | NOT CONFIRMED | NOT APPLICABLE | UNKNOWN> — <short evidence>
+
+The summary, detailed accessibility section, and recommended action must all agree with those exact
+per-need classifications. Never say "all needs are confirmed" in the summary if any per-need
+classification is NOT CONFIRMED, NOT APPLICABLE, or UNKNOWN. Never say "none are confirmed" if
+any need is CONFIRMED.
+
+Use the exact capitalization and wording returned by get_user_accessibility_needs when naming each
+need.
+
+
 FINAL RESPONSE
 
 At the end of an event analysis, clearly report:
@@ -822,7 +1199,12 @@ At the end of an event analysis, clearly report:
 4. Which accommodations remain unconfirmed or unknown
 5. The official accommodation request method available
 6. Any relevant preferred or required notice period
-7. The appropriate next action
+7. The appropriate next action, written as a concrete action rather than a
+   meta-instruction to ask Accessly what to do next. If the primary channel is an
+   accessible official form, say that Accessly can fill it for the user and will stop
+   before final submission for explicit approval.
+8. If check_event_timing was used, the event lifecycle (upcoming/today/ongoing/past)
+   and the exact notice-window state returned by the tool
 
 If an email draft is needed, present it and wait for explicit user approval
 before taking any sending action.
@@ -845,9 +1227,11 @@ Do not ask the user for their name again if it is already available from the sav
 
 FORM SUBMISSION APPROVAL
 Never submit an accommodation form without explicit user approval.
+When a usable official form is the best channel, Accessly should fill it on the user's behalf rather
+than merely directing the user to the form.
 Before submission:
-Fill all available fields using verified information.
-Show the user exactly what will be submitted.
+Fill all available fields using verified information and the saved profile.
+Show the user exactly what Accessly entered and what will be submitted.
 Ask for explicit approval.
 If the user changes any information:
 update the form
@@ -892,6 +1276,4 @@ if __name__ == "__main__":
             print("\nAccessly encountered an error.")
             print("Error type:", type(e).__name__)
             print("Error:", str(e))
-
-
 

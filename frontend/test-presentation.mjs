@@ -1,0 +1,13 @@
+﻿import fs from 'node:fs';
+import ts from 'typescript';
+import assert from 'node:assert/strict';
+const source = fs.readFileSync(new URL('./src/presentation.ts',import.meta.url),'utf8');
+const code = ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS}}).outputText;
+const exports = {};
+new Function('exports',code)(exports);
+assert.equal(exports.displayText('## Event **Details**'),'Event Details');
+assert.equal(exports.displayText('\ud83d\udcc5 September 30, 2026'),'September 30, 2026');
+assert.equal(exports.displayText('[Official page](https://example.com)'),'Official page');
+assert.equal(exports.displayText('NOT CONFIRMED'),'NOT CONFIRMED');
+assert.equal(exports.displayText('Community Center & Partners'),'Community Center & Partners');
+console.log('Display tests passed: Markdown and decorative emoji removed; fact text preserved.');
