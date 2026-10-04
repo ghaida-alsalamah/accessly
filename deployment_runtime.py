@@ -1,11 +1,8 @@
 """Public-hosting boundaries around the unchanged local agent."""
 
 import contextvars
-import hashlib
 import ipaddress
-import json
 import os
-import re
 import socket
 import sqlite3
 import time
@@ -15,6 +12,8 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from fastapi import HTTPException
+
+import db
 
 
 ROOT = Path(__file__).resolve().parent
@@ -97,63 +96,24 @@ if PUBLIC:
     )
 
 
-def visitor_directory():
+def current_user_id():
+    """
+    The database user this request acts for.
 
-    if not PUBLIC:
-        return DATA_ROOT
+    api.py's middleware verifies the JWT and
+    puts its user_id in OWNER; nothing else
+    (body, URL) can set it.
+    """
 
-    directory = (
-        DATA_ROOT
-        / "visitors"
-        / OWNER.get()
-    )
+    owner = OWNER.get()
 
-    directory.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    return directory
-
-
-def visitor_from_header(header):
-
-    if (
-        not header
-        or not re.fullmatch(
-            r"Bearer [0-9a-f]{64}",
-            header
-        )
-    ):
+    if not owner.isdigit():
         raise HTTPException(
             401,
-            "A browser visitor session is required. "
-            "Refresh the page."
+            "Log in first."
         )
 
-    return hashlib.sha256(
-        header[7:].encode()
-    ).hexdigest()
-
-
-def atomic_json(path, value):
-
-    path = Path(path)
-
-    temporary = path.with_suffix(
-        ".tmp"
-    )
-
-    temporary.write_text(
-        json.dumps(
-            value,
-            indent=2,
-            ensure_ascii=False
-        ),
-        encoding="utf-8"
-    )
-
-    temporary.replace(path)
+    return int(owner)
 
 
 def require_public_url(url):
@@ -300,32 +260,22 @@ def configure_agent(
     context
 ):
     """
-    Point existing persistence at this visitor,
+    Bind this session's tools to the current user,
     then enforce public-demo boundaries.
 
     The original browser tool is intentionally
     left unchanged.
     """
 
-    directory = visitor_directory()
-
     globals_ = namespace[
         "load_user_profile"
     ].__globals__
 
+    # Tools read USER_ID from here; the agent
+    # never chooses which user it acts for.
     globals_[
-        "PROFILE_FILE"
-    ] = (
-        directory
-        / "user_profile.json"
-    )
-
-    globals_[
-        "REQUESTS_FILE"
-    ] = (
-        directory
-        / "requests.json"
-    )
+        "USER_ID"
+    ] = current_user_id()
 
     if not PUBLIC:
         return
@@ -334,13 +284,6 @@ def configure_agent(
 
     agent = namespace["agent"]
     browser = namespace["browser"]
-
-    globals_[
-        "save_requests"
-    ] = lambda records: atomic_json(
-        directory / "requests.json",
-        records
-    )
 
     agent.callback_handler = (
         lambda **kwargs: None
@@ -552,52 +495,21 @@ def configure_agent(
                 {}
             )
 
-            for need in non_applicable:
-
-                if need in record.get(
-                    "accommodations",
-                    {}
-                ):
-                    record[
-                        "accommodations"
-                    ][need] = (
-                        "NOT APPLICABLE"
-                    )
-
             if (
                 non_applicable
                 and record.get(
                     "request_id"
                 )
             ):
-                records = globals_[
-                    "load_requests"
-                ]()
-
-                for (
-                    index,
-                    stored
-                ) in enumerate(
-                    records
-                ):
-                    if (
-                        stored[
-                            "request_id"
-                        ]
-                        == record[
-                            "request_id"
-                        ]
-                    ):
-                        records[
-                            index
-                        ] = record
-
-                        break
-
-                globals_[
-                    "save_requests"
-                ](
-                    records
+                outcome[
+                    "request"
+                ] = db.update_request(
+                    globals_["USER_ID"],
+                    record["request_id"],
+                    {
+                        need: "NOT APPLICABLE"
+                        for need in non_applicable
+                    }
                 )
 
             context[

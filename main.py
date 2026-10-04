@@ -1,17 +1,15 @@
 import os
+import logging
 from strands import Agent, tool
 from strands_tools.browser import LocalChromiumBrowser
 from datetime import date, datetime
-import smtplib
-import ssl
 import unicodedata
-from email.message import EmailMessage
 import imaplib
 import email
 from email.header import decode_header
-import json
-from pathlib import Path
 from dotenv import load_dotenv
+import db
+from mailer import send_test_mode_email
 
 load_dotenv()
 
@@ -56,17 +54,17 @@ def check_event_accessibility(event_url: str):
         "event_url": event_url
     }
 
-PROFILE_FILE = Path("user_profile.json")
+# Set by the server (deployment_runtime.configure_agent) for each session.
+# Tools never take user_id from the agent, so the agent can't pick another user.
+USER_ID = None
 
 
-PROFILE_FILE = Path("user_profile.json")
+def current_user_id():
+    return USER_ID if USER_ID is not None else db.default_user_id()
+
 
 def load_user_profile():
-    if not PROFILE_FILE.exists():
-        return None
-
-    with open(PROFILE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return db.get_user_profile(current_user_id())
 
 
 @tool
@@ -125,47 +123,15 @@ def send_accommodation_email(
     """Send one approved accessibility accommodation email."""
 
     try:
-        # Remove ALL whitespace from copied credentials.
-        # This also removes hidden non-breaking spaces.
-        sender = "".join(os.environ["ACCESSLY_EMAIL"].split())
-        password = "".join(
-            os.environ["ACCESSLY_EMAIL_APP_PASSWORD"].split()
-        )
-        actual_recipient = "".join(
-            os.environ["ACCESSLY_TEST_RECIPIENT"].split()
-        )
-
         clean_recipient = "".join(recipient.split())
         clean_subject = clean_text(subject)
         clean_body = clean_text(body)
 
-        msg = EmailMessage()
-
-        msg["From"] = (
-            f"Accessly Accessibility Assistant <{sender}>"
+        actual_recipient = send_test_mode_email(
+            clean_recipient,
+            clean_subject,
+            clean_body
         )
-        msg["To"] = actual_recipient
-        msg["Subject"] = clean_subject
-
-        msg.set_content(
-            f"""TEST MODE
-
-Intended recipient: {clean_recipient}
-
-{clean_body}
-""",
-            charset="utf-8"
-        )
-
-        context = ssl.create_default_context()
-
-        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
-            smtp.ehlo()
-            smtp.starttls(context=context)
-            smtp.ehlo()
-
-            smtp.login(sender, password)
-            smtp.send_message(msg)
 
         return {
             "status": "sent",
@@ -218,15 +184,10 @@ def normalize_subject(subject):
 
 
 @tool
-def check_organizer_reply(request_id: str):
+def check_organizer_reply(request_id: int):
     """Check the Accessly inbox for a reply to a tracked request."""
 
-    requests = load_requests()
-
-    request_record = next(
-        (r for r in requests if r["request_id"] == request_id),
-        None
-    )
+    request_record = db.get_request(current_user_id(), request_id)
 
     if not request_record:
         return {
@@ -379,21 +340,6 @@ def confirm_accommodation(request_id: str):
         "status": "not_found"
     }
 
-REQUESTS_FILE = Path("requests.json")
-
-
-def load_requests():
-    if not REQUESTS_FILE.exists():
-        return []
-
-    with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_requests(requests):
-    with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(requests, f, indent=2, ensure_ascii=False)
-
 @tool
 def create_request_record(
     event_name: str,
@@ -411,73 +357,136 @@ def create_request_record(
             "message": "User profile could not be loaded."
         }
 
-    needs = profile.get("needs", [])
+    record = db.create_request(
+        current_user_id(),
+        event_name,
+        event_url,
+        organizer_email,
+        email_subject
+    )
 
-    if not needs:
+    if record is None:
         return {
             "status": "failed",
             "message": "No accessibility needs found."
         }
 
-    requests = load_requests()
-
-    request_id = f"REQ-{len(requests) + 1:03d}"
-
-    record = {
-        "request_id": request_id,
-        "event_name": event_name,
-        "event_url": event_url,
-        "organizer_email": organizer_email,
-        "email_subject": email_subject,
-        "status": "PENDING",
-        "accommodations": {
-            need: "PENDING"
-            for need in needs
-        }
-    }
-
-    requests.append(record)
-    save_requests(requests)
-
     return {
         "status": "created",
         "request": record
     }
-    requests.append(record)
-    save_requests(requests)
-
-    return record
 
 @tool
 def update_request_status(
-    request_id: str,
+    request_id: int,
     status: str,
     accommodation_statuses: dict[str, str]
 ):
     """Update the status of a tracked accessibility request."""
 
-    requests = load_requests()
+    status = status.strip().upper()
+    accommodation_statuses = {
+        accommodation: new_status.strip().upper()
+        for accommodation, new_status in accommodation_statuses.items()
+    }
 
-    for request in requests:
-        if request["request_id"] == request_id:
+    invalid_accommodations = [
+        value
+        for value in accommodation_statuses.values()
+        if value not in db.NEED_STATUSES
+    ]
 
-            request["status"] = status
+    if status not in db.OVERALL_STATUSES or invalid_accommodations:
+        return {
+            "status": "failed",
+            "message": "Use only the allowed status values.",
+            "allowed_overall_statuses": sorted(db.OVERALL_STATUSES),
+            "allowed_accommodation_statuses": sorted(db.NEED_STATUSES)
+        }
 
-            for accommodation, new_status in accommodation_statuses.items():
-                if accommodation in request["accommodations"]:
-                    request["accommodations"][accommodation] = new_status
+    request = db.update_request(
+        current_user_id(),
+        request_id,
+        accommodation_statuses,
+        overall_status=status
+    )
 
-            save_requests(requests)
-
-            return {
-                "status": "updated",
-                "request": request
-            }
+    if request is not None:
+        return {
+            "status": "updated",
+            "request": request,
+            "user_notified": notify_user_of_status_changes(request_id)
+        }
 
     return {
         "status": "not_found",
         "request_id": request_id
     }
+
+
+ARABIC_STATUSES = {
+    "PENDING": "قيد الانتظار",
+    "CONFIRMED": "مؤكد",
+    "NOT CONFIRMED": "غير مؤكد",
+    "NOT APPLICABLE": "لا ينطبق",
+    "UNAVAILABLE": "غير متوفر",
+    "UNCLEAR": "غير واضح",
+    "UNKNOWN": "غير معروف",
+    "MORE INFORMATION NEEDED": "يحتاج معلومات إضافية",
+}
+
+
+def build_status_email(preferred_language, event_name, changes):
+    """Return (subject, body) for a status update, in Arabic or English."""
+
+    if (preferred_language or "").strip().lower().startswith("ar"):
+        lines = "\n".join(
+            f"- {need}: {ARABIC_STATUSES.get(status, status)}"
+            for need, status in changes
+        )
+        return (
+            f"تحديث على طلب الإتاحة: {event_name}",
+            f"مرحباً،\n\n"
+            f"تغيّرت حالة احتياجاتك التالية في طلب الإتاحة لفعالية \"{event_name}\":\n\n"
+            f"{lines}\n\n"
+            f"مع تحيات فريق Accessly"
+        )
+
+    lines = "\n".join(
+        f"- {need}: {status.capitalize()}"
+        for need, status in changes
+    )
+    return (
+        f"Update on your accessibility request: {event_name}",
+        f"Hello,\n\n"
+        f"The status of these needs changed in your accessibility request for \"{event_name}\":\n\n"
+        f"{lines}\n\n"
+        f"Best regards,\nThe Accessly team"
+    )
+
+
+def notify_user_of_status_changes(request_id):
+    """Email the user once about every need whose status changed. Not an agent tool.
+
+    The user's email never leaves this function: errors go to the server log only,
+    because SMTP error messages can contain the recipient address.
+    Returns True if an email was sent.
+    """
+
+    def send(user_email, preferred_language, event_name, changes):
+        subject, body = build_status_email(preferred_language, event_name, changes)
+        try:
+            send_test_mode_email(user_email, subject, body)
+            return True
+        except Exception:
+            logging.exception("Status notification email failed for request %s", request_id)
+            return False
+
+    try:
+        return db.notify_status_changes(request_id, send) > 0
+    except Exception:
+        logging.exception("Status notification failed for request %s", request_id)
+        return False
 
 agent = Agent(
     tools=[
@@ -753,7 +762,7 @@ Do not create duplicate records for the same send action.
 EMAIL REPLY CHECKING
 
 When the user asks to check a tracked request, call
-check_organizer_reply using the request_id, for example REQ-001.
+check_organizer_reply using the numeric request_id, for example 1.
 
 Do not use the request ID itself as an email subject search term.
 
@@ -779,7 +788,9 @@ When check_organizer_reply finds a reply for a tracked request:
    or live captions.
 
 2. Determine the status of each stored accommodation using only the
-   organizer's explicit response.
+   organizer's explicit response. Each accommodation status must be one of:
+   CONFIRMED, NOT CONFIRMED, NOT APPLICABLE, UNAVAILABLE, UNCLEAR,
+   UNKNOWN, MORE INFORMATION NEEDED, PENDING
 
 3. Determine the overall request status as one of:
    - CONFIRMED
@@ -872,7 +883,7 @@ if __name__ == "__main__":
     print("\nAccessly is ready.")
     print("Examples:")
     print("  Check this event: https://events.example.com/event/123")
-    print("  Check reply for REQ-001")
+    print("  Check reply for request 1")
     print("  Type 'exit' to quit.\n")
 
     while True:

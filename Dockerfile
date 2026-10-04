@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements-production.txt \
     && useradd --create-home --uid 10001 accessly \
     && mkdir -p /var/data/accessly \
     && chown -R accessly:accessly /app /var/data/accessly
-COPY --chown=accessly:accessly api.py main.py result_presenter.py deployment_runtime.py ./
+COPY --chown=accessly:accessly api.py main.py db.py auth.py mailer.py result_presenter.py deployment_runtime.py ./
 COPY --from=frontend-build --chown=accessly:accessly /frontend/dist ./frontend/dist
 USER accessly
 EXPOSE 8000

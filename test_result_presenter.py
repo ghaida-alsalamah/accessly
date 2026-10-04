@@ -87,8 +87,7 @@ class MappingTests(unittest.TestCase):
             def __call__(self,message): self.count+=1; return REPORT
         agent=FakeAgent()
         result=serialize(extraction(),REPORT,['ASL interpretation'],'https://event.example/one')
-        def read(name, fallback): return {'needs':['ASL interpretation']} if name=='user_profile.json' else []
-        with patch.object(api,'configure_agent'),patch.object(api,'worker',InlineWorker()),patch.object(api.runpy,'run_path',return_value={'agent':agent}),patch.object(api,'format_result',return_value=result),patch.object(api,'read_json',side_effect=read):
+        with patch.object(api,'configure_agent'),patch.object(api,'worker',InlineWorker()),patch.object(api.runpy,'run_path',return_value={'agent':agent}),patch.object(api,'format_result',return_value=result),patch.object(api,'current_user_id',return_value=1),patch.object(api.auth,'user_from_header',return_value=1),patch.object(api,'saved_needs',return_value=['ASL interpretation']),patch.object(api.db,'list_requests',return_value=[]):
             api.jobs.clear();api.sessions.clear();api.session_context.clear()
             client=TestClient(api.app)
             submitted=client.post('/api/events',json={'url':'https://event.example/one'})
