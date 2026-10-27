@@ -97,3 +97,66 @@ Not yet tested: Linux image build/dependency availability, Linux Chromium launch
 container memory usage, Northflank SMTP/IMAP, or public end-to-end flow. Do not
 claim runtime verification before checking the remote build, deployed /health,
 container smoke test and deployment logs. Local Docker Desktop is not required.
+
+
+## Selective database/auth integration
+
+The current frontend and event/research pipeline are retained. User profiles and
+request records now use PostgreSQL; protected API routes require a JWT in both
+local and public modes. Health and registration/OTP routes remain public.
+The former random visitor token is not a login credential.
+
+Required new backend environment variables:
+
+- `DATABASE_URL`: PostgreSQL connection URI, including the provider's TLS options.
+- `JWT_SECRET`: at least 32 random characters; used for JWT signing and OTP hashing.
+- `DEFAULT_USER_ID`: only for direct terminal use of `main.py`; must identify an
+  existing user. API requests derive ownership solely from the verified JWT.
+
+Keep `AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION`, `FIRECRAWL_API_KEY`, and the existing
+Gmail/test-recipient, CORS, browser, data-directory and quota configuration.
+`.env.production.example` documents the variable names. No secrets belong in
+frontend/VITE variables. Local API startup loads the root `.env`; containers with
+`PYTHON_DOTENV_DISABLED=1` require runtime environment settings instead.
+
+No database or tables are created at startup. Before enabling the integrated
+workflow, provision a separate PostgreSQL database and user, inspect any existing
+tables, and apply the reviewed schema explicitly. With `DATABASE_URL` already
+exported in the shell, the later, separately authorized command is:
+
+```bash
+psql -X --dbname="$DATABASE_URL" --set=ON_ERROR_STOP=1 --single-transaction --file=schema.sql
+```
+
+This command is not run by the application or Docker build. `IF NOT EXISTS` does
+not upgrade existing tables. Existing JSON profiles/requests are not imported or
+deleted; a later import needs explicit user ownership mapping.
+
+After schema setup, install `requirements-production.txt` in the intended backend
+environment and start the existing Uvicorn command. Registration uses the existing
+three-step UI, followed by email-code verification in Login. Registration alone
+returns a user ID, not a token. Preferences are saved only after verification;
+existing users load their saved preferences after Login. New registrations use
+English as the explicit default preferred language.
+
+OTP email delivery intentionally remains TEST MODE: every code goes to
+`ACCESSLY_TEST_RECIPIENT`, with the intended user's email identified in the body.
+The generic send-code response does not confirm successful delivery; failures are
+logged. Codes expire after five minutes, have a 60-second resend cooldown, and
+allow five wrong guesses. JWTs last seven days; there is no refresh-token or
+server-side revocation endpoint. Frontend logout clears its token and only
+Accessly conversation caches, then returns to Intro.
+
+The database uses integer request primary keys internally. API and agent tools
+continue exposing `REQ-001`-style strings and the existing accommodations/job/result
+structures. Existing browser research, send approvals, email thread matching,
+formatting retries, result presentation and polling are preserved. Job and agent
+sessions are still in memory and expire when the backend restarts. SQLite quota
+storage still needs a persistent `ACCESSLY_DATA_DIR` in public mode.
+
+The added `test_auth.py` uses mocked database connections and rejects any real
+`psycopg.connect()` attempt. Run it with test-only secrets and dotenv disabled to
+avoid loading local credentials. Legacy tests that assume anonymous visitor
+headers or patch the JSON API storage helper need separate fixture updates for
+JWT-backed storage. No live PostgreSQL, email or model service is needed by the
+new auth/storage tests.

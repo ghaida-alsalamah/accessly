@@ -20,6 +20,13 @@ RUN pip install --no-cache-dir -r requirements-production.txt \
 COPY --chown=accessly:accessly \
     api.py \
     main.py \
+    db.py \
+    persistence.py \
+    firebase_runtime.py \
+    firestore_store.py \
+    saved_events.py \
+    auth.py \
+    mailer.py \
     web_retrieval.py \
     result_presenter.py \
     deployment_runtime.py \

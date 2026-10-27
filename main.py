@@ -4,6 +4,7 @@ from strands_tools.browser import LocalChromiumBrowser
 from datetime import date, datetime
 import smtplib
 import ssl
+import certifi
 import unicodedata
 import re
 import html as html_lib
@@ -15,6 +16,7 @@ import email
 from email.header import decode_header
 import json
 from pathlib import Path
+from persistence import store as db
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -170,15 +172,15 @@ def check_event_accessibility(event_url: str):
         "event_url": event_url
     }
 
-PROFILE_FILE = Path("user_profile.json")
+USER_ID = None
+
+
+def current_user_id():
+    return USER_ID if USER_ID is not None else db.default_user_id()
+
 
 def load_user_profile():
-    if not PROFILE_FILE.exists():
-        return None
-
-    with open(PROFILE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
+    return db.get_user_profile(current_user_id())
 
 @tool
 
@@ -235,6 +237,7 @@ def send_accommodation_email(
 ):
     """Send one approved accessibility accommodation email."""
 
+    stage = "configuration"
     try:
         # Remove ALL whitespace from copied credentials.
         # This also removes hidden non-breaking spaces.
@@ -268,15 +271,26 @@ Intended recipient: {clean_recipient}
             charset="utf-8"
         )
 
-        context = ssl.create_default_context()
+        context = ssl.create_default_context(cafile=certifi.where())
 
-        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+        stage = "connection"
+        smtp = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+        try:
             smtp.ehlo()
+            stage = "TLS certificate verification"
             smtp.starttls(context=context)
             smtp.ehlo()
 
+            stage = "authentication"
             smtp.login(sender, password)
-            smtp.send_message(msg)
+            stage = "message submission"
+            refused = smtp.send_message(msg)
+            if refused:
+                raise smtplib.SMTPRecipientsRefused(refused)
+        finally:
+            # DATA acceptance confirms submission. A later QUIT disconnect must
+            # not report failure and cause the user to resend an accepted email.
+            smtp.close()
 
         return {
             "status": "sent",
@@ -287,11 +301,20 @@ Intended recipient: {clean_recipient}
         }
 
     except Exception as e:
+        if isinstance(e, ssl.SSLCertVerificationError):
+            message = "Accessly could not verify Gmail's TLS certificate. The email was not sent."
+        elif isinstance(e, smtplib.SMTPAuthenticationError):
+            message = "Gmail rejected Accessly's sender credentials. Check the sender's Gmail App Password. The email was not sent."
+        elif isinstance(e, smtplib.SMTPServerDisconnected):
+            message = f"Gmail closed the connection during {stage}. Delivery was not confirmed."
+        else:
+            message = f"Accommodation email failed during {stage}. Delivery was not confirmed."
         return {
             "status": "failed",
             "error_type": type(e).__name__,
-            "error": str(e),
-            "message": "Email was not sent."
+            "error": message,
+            "message": message + " Your approved draft is unchanged; approve it again to retry.",
+            "draft": {"to": recipient, "subject": subject, "body": body}
         }
 
 def decode_email_header(value):
@@ -559,20 +582,15 @@ def confirm_accommodation(request_id: str):
         "status": "not_found"
     }
 
-REQUESTS_FILE = Path("requests.json")
-
-
 def load_requests():
-    if not REQUESTS_FILE.exists():
-        return []
-
-    with open(REQUESTS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return db.list_requests(current_user_id())
 
 
 def save_requests(requests):
-    with open(REQUESTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(requests, f, indent=2, ensure_ascii=False)
+    # The existing tracking guard saves updated records through this adapter.
+    for record in requests:
+        db.update_request(current_user_id(), record["request_id"],
+                          record["accommodations"], record["status"])
 
 @tool
 def create_request_record(
@@ -599,25 +617,10 @@ def create_request_record(
             "message": "No accessibility needs found."
         }
 
-    requests = load_requests()
-
-    request_id = f"REQ-{len(requests) + 1:03d}"
-
-    record = {
-        "request_id": request_id,
-        "event_name": event_name,
-        "event_url": event_url,
-        "organizer_email": organizer_email,
-        "email_subject": email_subject,
-        "status": "PENDING",
-        "accommodations": {
-            need: "PENDING"
-            for need in needs
-        }
-    }
-
-    requests.append(record)
-    save_requests(requests)
+    record = db.create_request(current_user_id(), event_name, event_url,
+                               organizer_email, email_subject)
+    if record is None:
+        return {"status": "failed", "message": "No accessibility needs found."}
 
     return {
         "status": "created",
@@ -632,28 +635,14 @@ def update_request_status(
 ):
     """Update the status of a tracked accessibility request."""
 
-    requests = load_requests()
-
-    for request in requests:
-        if request["request_id"] == request_id:
-
-            request["status"] = status
-
-            for accommodation, new_status in accommodation_statuses.items():
-                if accommodation in request["accommodations"]:
-                    request["accommodations"][accommodation] = new_status
-
-            save_requests(requests)
-
-            return {
-                "status": "updated",
-                "request": request
-            }
-
-    return {
-        "status": "not_found",
-        "request_id": request_id
-    }
+    try:
+        request = db.update_request(current_user_id(), request_id,
+                                    accommodation_statuses, status)
+    except ValueError as error:
+        return {"status": "failed", "message": str(error)}
+    if request is not None:
+        return {"status": "updated", "request": request}
+    return {"status": "not_found", "request_id": request_id}
 
 agent = Agent(
     tools=[

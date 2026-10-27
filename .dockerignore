@@ -1,0 +1,10 @@
+
+.git
+.env
+.env.*
+.venv
+**/*firebase-adminsdk*.json
+node_modules
+frontend/node_modules
+**/.env
+**/.env.*

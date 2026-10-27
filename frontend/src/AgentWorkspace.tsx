@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { api, waitForJob, type Job, type TrackedRequest } from "./api";
+import SaveEventAction from "./SaveEventAction";
 import type { AgentPresentation } from "./presentation";
 import AgentResult, { StatusBadge, ReadableText } from "./AgentResult";
 
@@ -11,6 +12,7 @@ export default function AgentWorkspace({ url, onBack, onDone }: { url: string; o
   const [turns, setTurns] = useState<Turn[]>([]);
   const [needs, setNeeds] = useState<string[]>([]);
   const [busy, setBusy] = useState(true);
+  const [savingEvent, setSavingEvent] = useState(false);
   const [error, setError] = useState('');
   const [answer, setAnswer] = useState('');
   const [success, setSuccess] = useState('');
@@ -72,23 +74,24 @@ export default function AgentWorkspace({ url, onBack, onDone }: { url: string; o
   }, [url]);
   const latestAgent = turns.reduce((last, turn, index) => turn.role === 'agent' ? index : last, -1);
   return <div className="workspace-shell">
-    <nav className="workspace-nav" aria-label="Workspace"><button className="secondary-button" onClick={onBack} disabled={busy}>← Home</button><span className="brand-wordmark">Accessly<span aria-hidden="true"> ✦</span></span><button className="secondary-button" onClick={onDone} disabled={busy}>My Requests</button></nav>
+    <nav className="workspace-nav" aria-label="Workspace"><button className="secondary-button" onClick={onBack} disabled={busy || savingEvent}>← Home</button><span className="brand-wordmark">Accessly<span aria-hidden="true"> ✦</span></span><button className="secondary-button" onClick={onDone} disabled={busy || savingEvent}>My Requests</button></nav>
     <header className="workspace-header"><span className="eyebrow">Your event companion</span><h1>Know before you go.</h1><p>Clear answers. Your needs. You decide what happens next.</p><a className="source-link" href={url} target="_blank" rel="noopener noreferrer">{url} ↗</a></header>
     <div className="conversation" aria-label="Conversation">
-      {turns.map((turn, index) => turn.role === 'user' ? <div className="user-message" key={index}><span className="eyebrow">You</span><p>{turn.text}</p></div> : index === latestAgent ? <AgentResult key={index} result={turn.result} disabled={busy} onReply={text => void run(text)} onRetry={() => void retryFormatting()} /> : <div className="previous-response" key={index}><span className="eyebrow">Accessly</span><ReadableText text={turn.text}/></div>)}
+      {turns.map((turn, index) => turn.role === 'user' ? <div className="user-message" key={index}><span className="eyebrow">You</span><p>{turn.text}</p></div> : index === latestAgent ? <AgentResult key={index} result={turn.result} disabled={busy || savingEvent} onReply={text => void run(text)} onRetry={() => void retryFormatting()} /> : <div className="previous-response" key={index}><span className="eyebrow">Accessly</span><ReadableText text={turn.text}/></div>)}
     </div>
     {busy && <div className="loading-card" role="status"><span className="loading-orbit" aria-hidden="true"/><div><strong>{action === 'send' ? 'Accessly is processing your approved request…' : action === 'reply' ? 'Accessly is considering your reply…' : 'Accessly is checking the event…'}</strong><p>Checking official information can take a few minutes. You can leave this tab open.</p></div></div>}
-    {error && <div className="error-card" role="alert"><strong>We couldn’t complete that action.</strong><p>{error}</p>{job?.status === 'processing' && <button className="secondary-button" disabled={busy} onClick={() => void run(undefined, job)}>Reconnect to current action</button>}{!job && <button className="secondary-button" onClick={onBack}>Return home</button>}</div>}
-    {success && <div className="success-card" role="status"><strong>Request sent to test inbox</strong><p>{success}</p><button className="secondary-button" onClick={onDone}>View My Requests</button></div>}
-    {job && <form className="result-card composer" onSubmit={e => { e.preventDefault(); if (answer.trim() && !busy) { const message = answer.trim(); setAnswer(''); void run(message); } }}>
+    {error && <div className="error-card" role="alert"><strong>We couldn’t complete that action.</strong><p>{error}</p>{job?.status === 'processing' && <button className="secondary-button" disabled={busy || savingEvent} onClick={() => void run(undefined, job)}>Reconnect to current action</button>}{!job && <button className="secondary-button" onClick={onBack}>Return home</button>}</div>}
+    {success && <div className="success-card" role="status"><strong>Request sent to test inbox</strong><p>{success}</p><button className="secondary-button" onClick={onDone} disabled={savingEvent}>View My Requests</button></div>}
+    {job && <form className="result-card composer" onSubmit={e => { e.preventDefault(); if (answer.trim() && !busy && !savingEvent) { const message = answer.trim(); setAnswer(''); void run(message); } }}>
       <label htmlFor="agent-answer">Continue the conversation</label><p className="helper-text">Ask a question, add a detail, or request a change. Sending requires your explicit approval of the exact draft.</p>
-      <textarea id="agent-answer" placeholder="What would you like Accessly to know?" rows={3} value={answer} onChange={e => setAnswer(e.target.value)} maxLength={12000} disabled={busy} />
-      <div className="button-row"><span className="helper-text">Your preferences stay in your profile.</span><button className="primary-button" disabled={busy || !answer.trim()}>Send reply ↑</button></div>
+      <textarea id="agent-answer" placeholder="What would you like Accessly to know?" rows={3} value={answer} onChange={e => setAnswer(e.target.value)} maxLength={12000} disabled={busy || savingEvent} />
+      <div className="button-row"><span className="helper-text">Your preferences stay in your profile.</span><button className="primary-button" disabled={busy || savingEvent || !answer.trim()}>Send reply ↑</button></div>
     </form>}
+    <SaveEventAction job={job} turns={turns} busy={busy} onBusy={setSavingEvent} onSaved={onDone}/>
   </div>;
 }
 
-export function RequestsView({ onBack }: { onBack: () => void }) {
+export function RequestsView({ onBack, savedEvents }: { onBack: () => void; savedEvents?: ReactNode }) {
   const [requests, setRequests] = useState<TrackedRequest[]>([]);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState('');
@@ -109,6 +112,7 @@ export function RequestsView({ onBack }: { onBack: () => void }) {
   }
   return <div className="workspace-shell"><nav className="workspace-nav"><button className="secondary-button" onClick={onBack} disabled={!!busyId}>← Home</button><span className="brand-wordmark">Accessly ✦</span></nav>
     <header className="workspace-header"><span className="eyebrow">Every request, in one place</span><h1>My Requests</h1><p>Follow each accommodation from request to confirmation.</p></header>
+    {savedEvents}
     {loading && <div className="loading-card" role="status">Loading your requests…</div>}
     {error && <div className="error-card" role="alert"><strong>Couldn’t load an update</strong><p>{error}</p><button className="secondary-button" disabled={!!busyId} onClick={() => { setError(''); refresh().catch(e => setError(e.message)); }}>Refresh requests</button></div>}
     {busyId && <p className="loading-card" role="status">Accessly is checking for updates to {busyId}…</p>}

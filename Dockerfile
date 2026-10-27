@@ -3,6 +3,8 @@ WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
+ARG VITE_IDENTITY_PROVIDER=postgres
+ARG VITE_FIREBASE_AUTH_CONTINUE_URL
 RUN npm run build
 
 FROM python:3.11-slim-bookworm
@@ -18,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements-production.txt \
     && useradd --create-home --uid 10001 accessly \
     && mkdir -p /var/data/accessly \
     && chown -R accessly:accessly /app /var/data/accessly
-COPY --chown=accessly:accessly api.py main.py result_presenter.py deployment_runtime.py ./
+COPY --chown=accessly:accessly api.py main.py web_retrieval.py db.py persistence.py firebase_runtime.py firestore_store.py saved_events.py auth.py mailer.py result_presenter.py deployment_runtime.py ./
 COPY --from=frontend-build --chown=accessly:accessly /frontend/dist ./frontend/dist
 USER accessly
 EXPOSE 8000

@@ -13,6 +13,7 @@ import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from firebase_runtime import enabled as firebase_enabled
 from dotenv import load_dotenv
 from fastapi import HTTPException
 
@@ -154,6 +155,17 @@ def atomic_json(path, value):
     )
 
     temporary.replace(path)
+
+
+def current_user_id():
+    owner = OWNER.get()
+    if firebase_enabled():
+        if not owner or owner == "local" or "/" in owner:
+            raise HTTPException(401, "Log in first.")
+        return owner
+    if not owner.isdigit():
+        raise HTTPException(401, "Log in first.")
+    return int(owner)
 
 
 def require_public_url(url):
@@ -307,25 +319,17 @@ def configure_agent(
     left unchanged.
     """
 
-    directory = visitor_directory()
-
-    globals_ = namespace[
-        "load_user_profile"
-    ].__globals__
-
-    globals_[
-        "PROFILE_FILE"
-    ] = (
-        directory
-        / "user_profile.json"
-    )
-
-    globals_[
-        "REQUESTS_FILE"
-    ] = (
-        directory
-        / "requests.json"
-    )
+    globals_ = namespace["load_user_profile"].__globals__
+    # Capture the verified request owner for this agent's independent globals.
+    # Legacy test fixtures without an owner retain their file-storage adapters.
+    database_owner = str(context.get("owner", OWNER.get()))
+    firebase_owner = firebase_enabled() and bool(context.get("owner"))
+    if firebase_owner or database_owner.isdigit():
+        globals_["USER_ID"] = database_owner if firebase_owner else int(database_owner)
+    else:
+        directory = visitor_directory()
+        globals_["PROFILE_FILE"] = directory / "user_profile.json"
+        globals_["REQUESTS_FILE"] = directory / "requests.json"
 
     if not PUBLIC:
         return
@@ -335,12 +339,10 @@ def configure_agent(
     agent = namespace["agent"]
     browser = namespace["browser"]
 
-    globals_[
-        "save_requests"
-    ] = lambda records: atomic_json(
-        directory / "requests.json",
-        records
-    )
+    if not firebase_owner and not database_owner.isdigit():
+        globals_["save_requests"] = lambda records: atomic_json(
+            directory / "requests.json", records
+        )
 
     agent.callback_handler = (
         lambda **kwargs: None

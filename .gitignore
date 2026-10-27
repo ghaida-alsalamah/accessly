@@ -232,3 +232,6 @@ user_profile.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Firebase Admin private keys (never commit)
+**/*firebase-adminsdk*.json
