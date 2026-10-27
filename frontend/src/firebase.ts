@@ -10,11 +10,11 @@ export function firebaseAuth() {
   if (!authInstance) {
     const app = getApps()[0] || initializeApp({
       apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "AIzaSyBM8PLmaYjkBd8yQoN53PBmfxMAL2cKt_g",
-      authDomain: "accey-80215.firebaseapp.com",
+      authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "accey-80215.firebaseapp.com",
       projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "accey-80215",
-      storageBucket: "accey-80215.firebasestorage.app",
-      messagingSenderId: "278973770920",
-      appId: "1:278973770920:web:bf693995efd7506af8e69d",
+      storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "accey-80215.firebasestorage.app",
+      messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "278973770920",
+      appId: import.meta.env.VITE_FIREBASE_APP_ID || "1:278973770920:web:bf693995efd7506af8e69d",
     });
     authInstance = getAuth(app);
     if (import.meta.env.DEV && import.meta.env.VITE_FIREBASE_AUTH_EMULATOR_URL) {
@@ -32,7 +32,8 @@ export async function loginWithPassword(email: string, password: string) {
   return (await signInWithEmailAndPassword(firebaseAuth(), email.trim(), password)).user;
 }
 export async function resetPassword(email: string) {
-  await sendPasswordResetEmail(firebaseAuth(), email.trim(), { url: `${window.location.origin}/` });
+  // Use Firebase's hosted reset page; local/preview origins may not be authorized.
+  await sendPasswordResetEmail(firebaseAuth(), email.trim());
 }
 export function authErrorMessage(error: unknown): string {
   const code = (error as { code?: string })?.code;

@@ -232,3 +232,28 @@ Firestore profile fields contained no password. A first live follow-up assertion
 failed; a subsequent staged run passed signup/logout/login/preferences. No real
 password-reset email was sent; reset completion and passwordless UID retention
 were verified in isolated emulators.
+
+
+## Replacement Firebase project (2026-10-27)
+
+The replacement Spark project is `accey-demo` (Accessly Demo). Its web app is
+Accessly Web, app ID `1:1090447780261:web:b2a336d19a43b3086be04c`.
+Email/Password is enabled. Firestore Standard uses `europe-west2`, with browser
+reads/writes denied. Authorized domains include `accessly-murex.vercel.app`,
+`localhost`, and `127.0.0.1`. No billing upgrade or paid backups were enabled.
+
+Set all `VITE_FIREBASE_*` fields in `frontend/.env.example` together using the
+new web app configuration; keep `VITE_IDENTITY_PROVIDER=firebase`. On Vercel,
+keep `VITE_API_BASE_URL` pointed at the Northflank HTTPS URL ending in `/api`,
+then rebuild. Local `.env.local` uses a separate backend on port 8001 for testing.
+
+Northflank must use `ACCESSLY_IDENTITY_PROVIDER=firebase`,
+`FIREBASE_PROJECT_ID=accey-demo`, and `GOOGLE_APPLICATION_CREDENTIALS` pointing
+to a mounted **new-project** Admin service-account key. Keep this key out of
+frontend variables, Git, Docker build context, and logs. Retain the old project
+and key for rollback; existing accounts and data are not automatically migrated.
+
+Password resets use the Firebase-hosted reset page without a continue URL.
+A successful reset API response does not establish inbox delivery. Verify an
+actual reset email and password change with an account you control before
+claiming the delivery issue is solved.
