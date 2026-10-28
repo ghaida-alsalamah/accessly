@@ -1,3 +1,4 @@
+import AccessibilitySettings from "./AccessibilitySettings";
 import { useState, useRef, useEffect } from "react";
 import { api, setAccessToken, endSession, clearConversations } from "./api";
 import { firebaseEnabled, createPasswordAccount, loginWithPassword, resetPassword, authErrorMessage, firebaseAuth } from "./firebase";
@@ -145,6 +146,7 @@ const A11Y_OPTIONS = [
 function FlowingBg({ zIndex = 0 }: { zIndex?: number }) {
   return (
     <div
+      className="flowing-background"
       aria-hidden="true"
       style={{ position: "fixed", inset: 0, overflow: "hidden", zIndex, background: "#fdf8f4" }}
     >
@@ -224,6 +226,10 @@ function FlowingBg({ zIndex = 0 }: { zIndex?: number }) {
         </defs>
         <ellipse cx="200" cy="190" rx="220" ry="170" fill="url(#bg6)" />
       </svg>
+      <div className="inclusive-backdrop" aria-hidden="true">
+        <img src={wheelchairWomanEntrance} alt="" className="inclusive-backdrop-left" />
+        <img src={wheelchairCampusApproach} alt="" className="inclusive-backdrop-right" />
+      </div>
     </div>
   );
 }
@@ -313,116 +319,40 @@ function ActionCard({ icon, iconBg, cardBg, cardBorder, title, description, arro
 }
 
 /* ── Home View ── */
-function HomeView({ onNavigate, onEditAccessibility }: { onNavigate: (v: View) => void; onEditAccessibility: () => void }) {
-  return (
-    <div
-      style={{
-        minHeight: "100%",
-        display: "flex",
-        flexDirection: "column",
-        justifyContent: "flex-start",
-        paddingTop: "19vh",
-        paddingBottom: "19vh",
-        paddingLeft: "clamp(16px, 4vw, 28px)",
-        paddingRight: "clamp(16px, 4vw, 28px)",
-        position: "relative",
-        zIndex: 1,
-        maxWidth: 640,
-        margin: "0 auto",
-        width: "100%",
-        boxSizing: "border-box",
-      }}
-    >
-      {/* Hero */}
-      <div>
-        <h1
-          style={{
-            fontSize: "clamp(18px, 4.2vw, 22px)",
-            fontWeight: 800,
-            lineHeight: 1.2,
-            letterSpacing: "-0.02em",
-            color: "#1a1410",
-            margin: "0 0 8px",
-          }}
-        >
-          Turn any event link into
-          <br />
-          <span
-            style={{
-              background: "linear-gradient(90deg, #b02020 0%, #e05a2b 50%, #f0a040 100%)",
-              WebkitBackgroundClip: "text",
-              WebkitTextFillColor: "transparent",
-              backgroundClip: "text",
-            }}
-          >
-            real action
-          </span>
-        </h1>
-        <p
-          style={{
-            fontSize: 12,
-            fontWeight: 400,
-            color: "#7a6a60",
-            margin: "0 0 clamp(16px, 3.5vw, 24px)",
-            lineHeight: 1.55,
-            maxWidth: 260,
-          }}
-        >
-          Let our AI agent handle the details, so you can focus on what matters.
-        </p>
-
-        {/* Cards */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-          <ActionCard
-            onClick={() => onNavigate("drop")}
-            iconBg="linear-gradient(145deg, #e8703a 0%, #c0392b 100%)"
-            cardBg="rgba(248,228,210,0.58)"
-            cardBorder="rgba(220,130,80,0.22)"
-            arrowColor="orange"
-            title="Drop a Link"
-            description="Submit any event link and let the agent do the work."
-            icon={
-              <svg width="30" height="30" viewBox="0 0 36 36" fill="none" aria-hidden="true">
-                <path d="M21.5 14.5a5.5 5.5 0 010 7.78l-3.18 3.18a5.5 5.5 0 01-7.78-7.78l1.59-1.59" stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M14.5 21.5a5.5 5.5 0 010-7.78l3.18-3.18a5.5 5.5 0 017.78 7.78l-1.59 1.59" stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
-              </svg>
-            }
-          />
-          <ActionCard
-            onClick={() => onNavigate("events")}
-            iconBg="linear-gradient(145deg, #d8eaf8 0%, #b8d4f0 100%)"
-            cardBg="rgba(210,230,250,0.52)"
-            cardBorder="rgba(100,170,230,0.22)"
-            arrowColor="blue"
-            title="Previous Events"
-            description="See events you've searched before."
-            icon={
-              <svg width="30" height="30" viewBox="0 0 36 36" fill="none" aria-hidden="true">
-                <rect x="6" y="8" width="24" height="22" rx="4" stroke="#3a7abf" strokeWidth="2.3" />
-                <path d="M12 6v4M24 6v4M6 16h24" stroke="#3a7abf" strokeWidth="2.2" strokeLinecap="round" />
-                <path d="M12 22h12M12 26.5h7" stroke="#3a7abf" strokeWidth="2.1" strokeLinecap="round" />
-              </svg>
-            }
-          />
-        </div>
-
-        {/* Footer */}
-        <div style={{ marginTop: "clamp(20px, 5vw, 32px)", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "nowrap", gap: 12 }}>
-          <button type="button" onClick={onEditAccessibility} style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "4px 0", border: "none", background: "transparent", color: "#292421", fontSize: 12, fontFamily: "inherit", cursor: "pointer" }}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="m14 5 5 5M4 20l4.5-1L20 7.5a3.2 3.2 0 0 0-4.5-4.5L4 14.5 3 21Z" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-            Edit Accessibility
-          </button>
-          <button type="button" onClick={() => onNavigate("intro")} style={{ padding: "4px 0", border: "none", background: "transparent", color: "#292421", fontSize: 12, fontFamily: "inherit", cursor: "pointer", whiteSpace: "nowrap" }}>Log Out</button>
-        </div>
-      </div>
-
-    </div>
-  );
+function AccessibilityJourney() {
+  return <ol className="accessly-journey" aria-label="How Accessly works">
+    {[["Your needs", "Choose what supports you"], ["Check event", "Review details and evidence"], ["Request support", "Review and approve a request"]].map(([title, detail], i) =>
+      <li key={title}><span className="journey-number" aria-hidden="true">{i + 1}</span><div><strong>{title}</strong><span>{detail}</span></div></li>
+    )}
+  </ol>;
 }
 
-/* ── Drop Link View ── */
+function NeedCategories() {
+  return <ul className="need-categories" aria-label="Accessibility needs you can check">
+    {[["wheelchair", "Mobility"], ["captions", "Hearing"], ["large-print", "Vision"], ["quiet", "Sensory"], ["other", "Custom needs"]].map(([id, label]) =>
+      <li key={id}>{A11Y_OPTIONS.find(option => option.id === id)?.icon}<span>{label}</span></li>
+    )}
+  </ul>;
+}
+
+function HomeView({ onNavigate, onEditAccessibility, needs }: { onNavigate: (v: View) => void; onEditAccessibility: () => void; needs: string[] }) {
+  return <div className="accessly-home">
+    <header className="home-heading home-heading-compact">
+      <div><p className="product-eyebrow">ACCESSLY</p><h1>Your event accessibility</h1></div>
+    </header>
+    <div className="home-actions">
+      <ActionCard onClick={() => onNavigate("drop")} iconBg="linear-gradient(145deg, #a43c25, #852a21)" cardBg="#fffaf6" cardBorder="#bda494" arrowColor="orange" title="Check an event" description="Check an event against your saved needs." icon={A11Y_OPTIONS[0].icon} />
+      <ActionCard onClick={() => onNavigate("events")} iconBg="#dbeaf5" cardBg="#f8fbfd" cardBorder="#a5b9c8" arrowColor="blue" title="Previous Events" description="Revisit saved checks and follow accommodation requests." icon={A11Y_OPTIONS[2].icon} />
+    </div>
+    <section className="home-needs" aria-labelledby="your-needs-title">
+      <div className="home-section-heading"><h2 id="your-needs-title">Your accessibility needs</h2><button type="button" onClick={onEditAccessibility}>Edit needs</button></div>
+      <p>These saved preferences guide each event check.</p>
+      {needs.length ? <ul className="saved-need-chips">{needs.map(need => <li key={need}>{A11Y_OPTIONS.find(option => option.label === need)?.icon || A11Y_OPTIONS[A11Y_OPTIONS.length - 1].icon}<span>{need}</span></li>)}</ul> : <p>Add your needs to personalize your next check.</p>}
+    </section>
+    <footer className="home-footer"><span>You review requests before anything is sent.</span><button type="button" onClick={() => onNavigate("intro")}>Log Out</button></footer>
+  </div>;
+}
+
 function DropLinkView({ onBack, onSubmit }: { onBack: () => void; onSubmit: (url: string) => void }) {
   const [url, setUrl] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
@@ -462,8 +392,8 @@ function DropLinkView({ onBack, onSubmit }: { onBack: () => void; onSubmit: (url
             </svg>
           </div>
           <div>
-            <h1 style={{ fontSize: 15, fontWeight: 800, color: "#1a1410", margin: 0, letterSpacing: "-0.02em" }}>Drop a Link</h1>
-            <p style={{ fontSize: 11, color: "#7a6a60", margin: "3px 0 0" }}>Paste any event URL to get started.</p>
+            <h1 style={{ fontSize: 15, fontWeight: 800, color: "#1a1410", margin: 0, letterSpacing: "-0.02em" }}>Check an event</h1>
+            <p style={{ fontSize: 11, color: "#7a6a60", margin: "3px 0 0" }}>Check an educational or academic event against your saved needs.</p>
           </div>
         </div>
         <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 11 }}>
@@ -487,7 +417,7 @@ function DropLinkView({ onBack, onSubmit }: { onBack: () => void; onSubmit: (url
             onMouseEnter={(e) => { e.currentTarget.style.opacity = "0.9"; e.currentTarget.style.transform = "scale(1.01)"; }}
             onMouseLeave={(e) => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.transform = "scale(1)"; }}
           >
-            Process Event
+            Check Accessibility
           </button>
         </form>
       </div>
@@ -496,110 +426,11 @@ function DropLinkView({ onBack, onSubmit }: { onBack: () => void; onSubmit: (url
   );
 }
 
-type FlowFontSize = "small" | "default" | "large";
-
-function AccessibilityPill({
-  fontSize,
-  setFontSize,
-  speechText,
-}: {
-  fontSize: FlowFontSize;
-  setFontSize: (size: FlowFontSize) => void;
-  speechText?: string;
-}) {
-  const [panelOpen, setPanelOpen] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
-
-  useEffect(() => {
-    return () => {
-      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    };
-  }, []);
-
-  function toggleSpeech() {
-    if (!("speechSynthesis" in window)) return;
-    if (speaking) {
-      window.speechSynthesis.cancel();
-      setSpeaking(false);
-      return;
-    }
-
-    const visibleText = Array.from(
-      document.querySelectorAll<HTMLElement>(
-        "[data-accessibility-page] h1, [data-accessibility-page] h2, [data-accessibility-page] h3, [data-accessibility-page] p, [data-accessibility-page] label, [data-accessibility-page] button",
-      ),
-    )
-      .filter((element) => {
-        const style = window.getComputedStyle(element);
-        return style.display !== "none" && style.visibility !== "hidden" && !element.closest("[aria-hidden='true']");
-      })
-      .map((element) => element.innerText.trim())
-      .filter(Boolean)
-      .join(". ");
-
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(speechText || visibleText);
-    utterance.rate = 0.95;
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
-    window.speechSynthesis.speak(utterance);
-    setSpeaking(true);
-  }
+function PostIntroShell({ children }: { children: React.ReactNode; speechText: string }) {
 
   return (
-    <div className="floating-accessibility">
-      <div className={`intro-accessibility${speaking ? " accessibility-speaking" : ""}`} aria-label="Accessibility tools">
-        <button
-          type="button"
-          aria-label="Adjust font size"
-          aria-expanded={panelOpen}
-          onClick={() => setPanelOpen((open) => !open)}
-        >
-          <span aria-hidden="true">Aa</span>
-        </button>
-        <span className="intro-control-divider" aria-hidden="true" />
-        <button
-          type="button"
-          aria-label={speaking ? "Stop reading this page" : "Listen to this page"}
-          aria-pressed={speaking}
-          onClick={toggleSpeech}
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M5 10v4h3l4 3V7L8 10H5Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
-            <path d="M15 9.2a4 4 0 010 5.6M17.7 6.6a7.5 7.5 0 010 10.8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-          </svg>
-        </button>
-      </div>
-      {panelOpen && (
-        <div className="font-size-panel" role="group" aria-label="Choose font size">
-          {([
-            ["small", "A−"],
-            ["default", "A"],
-            ["large", "A+"],
-          ] as const).map(([value, label]) => (
-            <button
-              type="button"
-              className={fontSize === value ? "font-size-active" : ""}
-              aria-pressed={fontSize === value}
-              onClick={() => setFontSize(value)}
-              key={value}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function PostIntroShell({ children, speechText }: { children: React.ReactNode; speechText: string }) {
-  const [fontSize, setFontSize] = useState<FlowFontSize>("default");
-
-  return (
-    <main className="setup-screen post-intro-screen" data-font-size={fontSize}>
+    <main className="setup-screen post-intro-screen">
       <FlowingBg zIndex={-1} />
-      <AccessibilityPill fontSize={fontSize} setFontSize={setFontSize} speechText={speechText} />
       <div className="setup-scroll flow-scroll" data-accessibility-page>
         <div className="setup-header post-intro-header" aria-hidden="true" />
         {children}
@@ -609,11 +440,9 @@ function PostIntroShell({ children, speechText }: { children: React.ReactNode; s
 }
 
 function AccessibleApplicationShell({ children }: { children: React.ReactNode }) {
-  const [fontSize, setFontSize] = useState<FlowFontSize>("default");
 
   return (
-    <div className="later-accessibility-frame" data-font-size={fontSize}>
-      <AccessibilityPill fontSize={fontSize} setFontSize={setFontSize} />
+    <div className="later-accessibility-frame">
       <div className="later-accessibility-content" data-accessibility-page>
         {children}
       </div>
@@ -648,7 +477,9 @@ function AuthChoiceScreen({ onLogin, onCreate }: { onLogin: () => void; onCreate
       <section className="auth-choice" aria-labelledby="auth-title">
         <div className="auth-kicker">WELCOME</div>
         <h1 id="auth-title">How would you like to continue?</h1>
-        <p>Choose an option to start discovering experiences without barriers.</p>
+        <p>Save your accessibility needs, check event details, and request support before you go.</p>
+        <NeedCategories />
+        <AccessibilityJourney />
         <div className="auth-actions">
           <button className="flow-button flow-button-secondary" type="button" onClick={onLogin}>
             Log In
@@ -673,7 +504,14 @@ function BasicInformationScreen({ initialDetails, onContinue, onBack }: { initia
   const [confirmPassword, setConfirmPassword] = useState(initialDetails.confirmPassword);
   const [accepted, setAccepted] = useState(initialDetails.accepted);
   const [termsOpen, setTermsOpen] = useState(initialDetails.termsOpen);
-  const enabled = fullName.trim().length > 1 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && accepted && (!firebaseEnabled || (password.length >= 6 && password === confirmPassword));
+  const missingRequirements = [
+    !fullName.trim() && "enter your name",
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) && "enter a valid email address",
+    firebaseEnabled && password.length < 6 && "use a password with at least 6 characters",
+    firebaseEnabled && (!confirmPassword || password !== confirmPassword) && "confirm the same password",
+    !accepted && "agree to the Privacy Policy and Terms",
+  ].filter(Boolean);
+  const enabled = missingRequirements.length === 0;
 
   return (
     <PostIntroShell speechText="Step 1 of 3. Basic Information. Tell us about you. A few details to create your account. Full Name. Email Address. I agree to the Privacy Policy and Terms. Continue.">
@@ -688,7 +526,7 @@ function BasicInformationScreen({ initialDetails, onContinue, onBack }: { initia
             className="flow-form"
             onSubmit={(event) => {
               event.preventDefault();
-              if (enabled) onContinue({ fullName, email, password, confirmPassword, accepted, termsOpen });
+              if (enabled) onContinue({ fullName: fullName.trim(), email: email.trim(), password, confirmPassword, accepted, termsOpen });
             }}
           >
             <label className="flow-field">
@@ -911,10 +749,11 @@ function BasicInformationScreen({ initialDetails, onContinue, onBack }: { initia
                 </div>
               </div>
             </div>
-            <button className="setup-continue flow-submit" type="submit" disabled={!enabled}>
+            <button className="setup-continue flow-submit" type="submit" disabled={!enabled} aria-describedby={!enabled ? "signup-requirements" : undefined}>
               Continue
               <span aria-hidden="true">→</span>
             </button>
+            {!enabled && <p id="signup-requirements" className="signup-requirements">To continue: {missingRequirements.join("; ")}.</p>}
           </form>
       </section>
     </PostIntroShell>
@@ -1173,8 +1012,8 @@ function AccessibilitySetupScreen({ onContinue, initialNeeds = [], onCancel, onB
           </div>}
 
           <div className="setup-heading">
-            <h1 id="setup-title">What do you need?</h1>
-            <p>Select all that apply.</p>
+            <h1 id="setup-title">Your accessibility needs</h1>
+            <p>Select the support that matters to you. You can edit these preferences anytime.</p>
           </div>
 
           <div className="setup-grid" role="group" aria-label="Accessibility preferences">
@@ -1338,9 +1177,11 @@ function IntroScreen({ onEnter }: { onEnter: () => void }) {
         </div>
       </header>
 
-      <section className="intro-content" aria-labelledby="intro-title">
-        <p className="intro-eyebrow">EVENT ACCESSIBILITY CHECKER</p>
-        <h1 id="intro-title">Paste an event link and check its <span>accessibility</span>.</h1>
+      <section className="intro-content" aria-labelledby="intro-title" data-accessibility-page>
+        <p className="intro-eyebrow">EVENT ACCESSIBILITY</p>
+        <h1 id="intro-title">Check event accessibility <span>for your needs.</span></h1>
+        <p className="intro-support">Check event access details and request the support you need.</p>
+        <NeedCategories />
         <button
           className="intro-cta"
           type="button"
@@ -1359,13 +1200,12 @@ function IntroScreen({ onEnter }: { onEnter: () => void }) {
         </button>
       </section>
 
-      <p className="intro-footer-note">Events • Venues • Dining • Arts • Culture</p>
     </main>
   );
 }
 
 /* ── Root ── */
-export default function App() {
+function AccesslyApp() {
   const [view, setView] = useState<View>("intro");
   const [agentUrl, setAgentUrl] = useState("");
   const [accessibilityNeeds, setAccessibilityNeeds] = useState<string[]>([]);
@@ -1525,7 +1365,7 @@ export default function App() {
       <div style={{ minHeight: "100%", position: "relative" }}>
         <FlowingBg />
         <div role="main" style={{ minHeight: "100%" }}>
-          {view === "home" && <HomeView onNavigate={navigate} onEditAccessibility={() => { setProfileError(""); setEditingAccessibility(true); setView("setup"); }} />}
+          {view === "home" && <HomeView needs={accessibilityNeeds} onNavigate={navigate} onEditAccessibility={() => { setProfileError(""); setEditingAccessibility(true); setView("setup"); }} />}
           {view === "drop" && (
             <DropLinkView
               onBack={() => setView("home")}
@@ -1545,4 +1385,7 @@ export default function App() {
       </div>
     </AccessibleApplicationShell>
   );
+}
+export default function App() {
+  return <><AccesslyApp /><AccessibilitySettings /></>;
 }
